@@ -52,8 +52,11 @@ func (w *gRPCWriter) Write(p []byte) (n int, err error) {
 	case <-w.donec:
 		return 0, w.streamResult
 	case w.writesChan <- cmd:
-		// update fullObjectChecksum on every write and send it on finalWrite
-		if !w.disableAutoChecksum {
+		// Update fullObjectChecksum on every write and send it on finalWrite if not disabled.
+		// Skip checksum calculation if user configures MD5 or CRC32C themselves.
+		if !w.disableAutoChecksum &&
+			!w.sendCRC32C &&
+			w.attrs.MD5 == nil {
 			w.fullObjectChecksum = crc32.Update(w.fullObjectChecksum, crc32cTable, p)
 		}
 		// write command successfully delivered to sender. We no longer own cmd.
@@ -215,10 +218,18 @@ func (c *grpcStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 		}
 		w.streamSender = w.pickBufferSender()
 
+		// Writer does not use maxRetryDuration from retryConfig to maintain
+		// consistency with HTTP client behavior. Writers should use
+		// ChunkRetryDeadline for per-chunk timeouts and context for overall timeouts.
+		writerRetry := w.settings.retry
+		if writerRetry != nil {
+			writerRetry = writerRetry.clone()
+			writerRetry.maxRetryDuration = 0
+		}
 		w.streamResult = checkCanceled(run(w.preRunCtx, func(ctx context.Context) error {
 			w.lastErr = w.writeLoop(ctx)
 			return w.lastErr
-		}, w.settings.retry, w.settings.idempotent))
+		}, writerRetry, w.settings.idempotent))
 		w.setError(w.streamResult)
 		close(w.donec)
 	}()
@@ -840,7 +851,7 @@ func getObjectChecksums(params *getObjectChecksumsParams) *storagepb.ObjectCheck
 	}
 
 	// send user's checksum on last write op if available
-	if params.sendCRC32C {
+	if params.sendCRC32C || params.objectAttrs.MD5 != nil {
 		return toProtoChecksums(params.sendCRC32C, params.objectAttrs)
 	}
 	// TODO(b/461982277): Enable checksum validation for appendable takeover writer gRPC

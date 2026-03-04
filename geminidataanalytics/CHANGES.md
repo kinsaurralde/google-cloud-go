@@ -1,5 +1,32 @@
 # Changes
 
+## [0.7.0](https://github.com/googleapis/google-cloud-go/releases/tag/geminidataanalytics%2Fv0.7.0) (2026-02-05)
+
+### Features
+
+* add ClarificationMessage, thought-signature, formatted-data ([611f239](https://github.com/googleapis/google-cloud-go/commit/611f239219225fb03f6475c7238f497a349961e2))
+
+### Documentation
+
+* A comment for enum value THOUGHT in enum TextType is changed ([611f239](https://github.com/googleapis/google-cloud-go/commit/611f239219225fb03f6475c7238f497a349961e2))
+
+## [0.6.0](https://github.com/googleapis/google-cloud-go/releases/tag/geminidataanalytics%2Fv0.6.0) (2026-01-15)
+
+### Features
+
+* added sync APIs for the CRUD operations of Data Agent ([80379ed](https://github.com/googleapis/google-cloud-go/commit/80379edb1c47cd7c2d928d18762029cfe28420c0))
+
+## [0.5.0](https://github.com/googleapis/google-cloud-go/releases/tag/geminidataanalytics%2Fv0.5.0) (2026-01-08)
+
+### Features
+
+* add LookerGoldenQuery to Context ([db65e79](https://github.com/googleapis/google-cloud-go/commit/db65e7927e54b21a39a54f685810495d2885cb33))
+
+### Documentation
+
+* another bulk typo correction (#13527) ([90a4f21](https://github.com/googleapis/google-cloud-go/commit/90a4f21fc7c19aec71e92dfa9b810bad9544a7c0))
+* fix typo in README.md entries (#13526) ([ac32b85](https://github.com/googleapis/google-cloud-go/commit/ac32b85197bf5b33aeb3af1ac69b752dff7a8a57))
+
 ## [0.4.0](https://github.com/googleapis/google-cloud-go/releases/tag/geminidataanalytics%2Fv0.4.0) (2025-12-18)
 
 ### Features
