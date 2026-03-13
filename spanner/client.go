@@ -516,10 +516,12 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	}
 
 	var pool gtransport.ConnPool
+	var endpointClientOpts []option.ClientOption
 
 	if gme != nil {
 		// Use GCPMultiEndpoint if provided.
 		pool = &gmeWrapper{gme}
+    endpointClientOpts = append(endpointClientOpts, opts...)
 	} else if isFallbackEnabled, _ := strconv.ParseBool(os.Getenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK")); isFallbackEnabled && isDirectPathEnabled {
 		var primaryConn gtransport.ConnPool
 		var fallbackConn gtransport.ConnPool
@@ -529,6 +531,7 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 			option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(reqIDInjector.interceptUnary)),
 		)
 		allOpts := allClientOpts(config.NumChannels, config.Compression, opts...)
+    endpointClientOpts = append(endpointClientOpts, allOpts...)
 		primaryConn, err = gtransport.DialPool(ctx, allOpts...)
 		if err != nil {
 			return nil, err
@@ -573,6 +576,7 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 		)
 
 		allOpts := allClientOpts(config.NumChannels, config.Compression, opts...)
+		endpointClientOpts = append(endpointClientOpts, allOpts...)
 		pool, err = gtransport.DialPool(ctx, allOpts...)
 		if err != nil {
 			return nil, err
@@ -638,7 +642,9 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 
 	var locationRouter *locationRouter
 	if isExperimentalLocationAPIEnabled() {
-		locationRouter = newLocationRouter()
+		sc.baseClientOpts = endpointClientOpts
+		epCache := newEndpointClientCache(sc.createEndpointClient)
+		locationRouter = newLocationRouter(epCache)
 	}
 
 	// Create a session manager.
@@ -646,6 +652,10 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	if err != nil {
 		sc.close()
 		return nil, err
+	}
+
+	if locationRouter != nil {
+		sp.locationRouter = locationRouter
 	}
 
 	if enableLogClientOptions() {
@@ -862,6 +872,9 @@ func (c *Client) Close() {
 		defer cancel()
 		c.sm.close(ctx)
 	}
+	if c.locationRouter != nil {
+		c.locationRouter.Close()
+	}
 	c.sc.close()
 }
 
@@ -885,7 +898,7 @@ func (c *Client) Single() *ReadOnlyTransaction {
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.txReadOnly.clientContext = c.clientContext
-	t.txReadOnly.locationRouter = c.locationRouter
+
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t
@@ -914,7 +927,7 @@ func (c *Client) ReadOnlyTransaction() *ReadOnlyTransaction {
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.txReadOnly.clientContext = c.clientContext
-	t.txReadOnly.locationRouter = c.locationRouter
+
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t
@@ -987,7 +1000,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.txReadOnly.clientContext = c.clientContext
-	t.txReadOnly.locationRouter = c.locationRouter
+
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t, nil
@@ -1025,7 +1038,7 @@ func (c *Client) BatchReadOnlyTransactionFromID(tid BatchReadOnlyTransactionID) 
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.txReadOnly.clientContext = c.clientContext
-	t.txReadOnly.locationRouter = c.locationRouter
+
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t
@@ -1113,7 +1126,7 @@ func (c *Client) rwTransaction(ctx context.Context, f func(context.Context, *Rea
 			t.wb = []*Mutation{}
 			t.txOpts = c.txo.merge(options)
 			t.txReadOnly.clientContext = mergeClientContext(c.clientContext, t.txOpts.ClientContext)
-			t.txReadOnly.locationRouter = c.locationRouter
+
 			t.ct = c.ct
 			t.otConfig = c.otConfig
 		}

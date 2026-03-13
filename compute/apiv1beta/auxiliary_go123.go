@@ -231,6 +231,12 @@ func (it *HealthCheckServiceIterator) All() iter.Seq2[*computepb.HealthCheckServ
 
 // All returns an iterator. If an error is returned by the iterator, the
 // iterator will stop after that iteration.
+func (it *HealthCheckServicesScopedListPairIterator) All() iter.Seq2[HealthCheckServicesScopedListPair, error] {
+	return iterator.RangeAdapter(it.Next)
+}
+
+// All returns an iterator. If an error is returned by the iterator, the
+// iterator will stop after that iteration.
 func (it *HealthChecksScopedListPairIterator) All() iter.Seq2[HealthChecksScopedListPair, error] {
 	return iterator.RangeAdapter(it.Next)
 }
@@ -423,6 +429,12 @@ func (it *MultiMigMemberIterator) All() iter.Seq2[*computepb.MultiMigMember, err
 
 // All returns an iterator. If an error is returned by the iterator, the
 // iterator will stop after that iteration.
+func (it *NamedSetIterator) All() iter.Seq2[*computepb.NamedSet, error] {
+	return iterator.RangeAdapter(it.Next)
+}
+
+// All returns an iterator. If an error is returned by the iterator, the
+// iterator will stop after that iteration.
 func (it *NetworkAttachmentIterator) All() iter.Seq2[*computepb.NetworkAttachment, error] {
 	return iterator.RangeAdapter(it.Next)
 }
@@ -526,6 +538,12 @@ func (it *NodeTypesScopedListPairIterator) All() iter.Seq2[NodeTypesScopedListPa
 // All returns an iterator. If an error is returned by the iterator, the
 // iterator will stop after that iteration.
 func (it *NotificationEndpointIterator) All() iter.Seq2[*computepb.NotificationEndpoint, error] {
+	return iterator.RangeAdapter(it.Next)
+}
+
+// All returns an iterator. If an error is returned by the iterator, the
+// iterator will stop after that iteration.
+func (it *NotificationEndpointsScopedListPairIterator) All() iter.Seq2[NotificationEndpointsScopedListPair, error] {
 	return iterator.RangeAdapter(it.Next)
 }
 
@@ -700,6 +718,12 @@ func (it *ServiceAttachmentIterator) All() iter.Seq2[*computepb.ServiceAttachmen
 // All returns an iterator. If an error is returned by the iterator, the
 // iterator will stop after that iteration.
 func (it *ServiceAttachmentsScopedListPairIterator) All() iter.Seq2[ServiceAttachmentsScopedListPair, error] {
+	return iterator.RangeAdapter(it.Next)
+}
+
+// All returns an iterator. If an error is returned by the iterator, the
+// iterator will stop after that iteration.
+func (it *SnapshotGroupIterator) All() iter.Seq2[*computepb.SnapshotGroup, error] {
 	return iterator.RangeAdapter(it.Next)
 }
 

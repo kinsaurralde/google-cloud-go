@@ -1,5 +1,34 @@
 # Changes
 
+## [0.5.0](https://github.com/googleapis/google-cloud-go/releases/tag/vectorsearch%2Fv0.5.0) (2026-03-12)
+
+### Features
+
+* upgrade protobuf from v25.7 to v31.0 ([177550d](https://github.com/googleapis/google-cloud-go/commit/177550d454fe98dcd1cd6645bf9b4c51eef7a419))
+
+### Bug Fixes
+
+* Removed field DenseScannParams from SearchHint ([177550d](https://github.com/googleapis/google-cloud-go/commit/177550d454fe98dcd1cd6645bf9b4c51eef7a419))
+
+### Documentation
+
+* Changed default values for max_replica_count for AutoScaling ([177550d](https://github.com/googleapis/google-cloud-go/commit/177550d454fe98dcd1cd6645bf9b4c51eef7a419))
+
+## [0.4.0](https://github.com/googleapis/google-cloud-go/releases/tag/vectorsearch%2Fv0.4.0) (2026-03-05)
+
+### Features
+
+* Added index and search configuration management ([9c80b8b](https://github.com/googleapis/google-cloud-go/commit/9c80b8b4442a54c610826c1bb89cec5158b49314))
+
+### Bug Fixes
+
+* Removed obsolete field `vertex` from message `.google.cloud.vectorsearch.v1.Ranker` ([9c80b8b](https://github.com/googleapis/google-cloud-go/commit/9c80b8b4442a54c610826c1bb89cec5158b49314))
+* Removed obsolete message `VertexRanker` ([9c80b8b](https://github.com/googleapis/google-cloud-go/commit/9c80b8b4442a54c610826c1bb89cec5158b49314))
+
+### Documentation
+
+* Updated documentation for Index Creation, Import Data Objects, Search ([9c80b8b](https://github.com/googleapis/google-cloud-go/commit/9c80b8b4442a54c610826c1bb89cec5158b49314))
+
 ## [0.3.0](https://github.com/googleapis/google-cloud-go/releases/tag/vectorsearch%2Fv0.3.0) (2026-02-19)
 
 ### Features
