@@ -555,7 +555,7 @@ libraries:
       - internal/generated/snippets/apps/
     tag_format: '{id}/v{version}'
   - id: area120
-    version: 0.9.7
+    version: 0.10.0
     last_generated_commit: c288189b43c016dd3cf1ec73ce3cadee8b732f07
     apis:
       - path: google/area120/tables/v1alpha1
@@ -1205,7 +1205,7 @@ libraries:
       - internal/generated/snippets/bigquery/v2
     tag_format: bigquery/v{version}
   - id: bigtable
-    version: 1.42.0
+    version: 1.43.0
     last_generated_commit: 7a5706618f42f482acf583febcc7b977b66c25b2
     apis:
       - path: google/bigtable/admin/v2
@@ -5889,7 +5889,7 @@ libraries:
       - internal/generated/snippets/speech/
     tag_format: '{id}/v{version}'
   - id: storage
-    version: 1.61.2
+    version: 1.61.3
     last_generated_commit: 9eea40c74d97622bb0aa406dd313409a376cc73b
     apis:
       - path: google/storage/control/v2
@@ -6274,7 +6274,7 @@ libraries:
       - ^vectorsearch/apiv1/vectorsearchpb/.*$
     tag_format: '{id}/v{version}'
   - id: vertexai
-    version: 0.15.0
+    version: 0.16.0
     last_generated_commit: e8365a7f88fabe8717cb8322b8ce784b03b6daea
     apis: []
     source_roots:
