@@ -521,7 +521,7 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	if gme != nil {
 		// Use GCPMultiEndpoint if provided.
 		pool = &gmeWrapper{gme}
-    endpointClientOpts = append(endpointClientOpts, opts...)
+		endpointClientOpts = append(endpointClientOpts, opts...)
 	} else if isFallbackEnabled, _ := strconv.ParseBool(os.Getenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK")); isFallbackEnabled && isDirectPathEnabled {
 		var primaryConn gtransport.ConnPool
 		var fallbackConn gtransport.ConnPool
@@ -531,7 +531,7 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 			option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(reqIDInjector.interceptUnary)),
 		)
 		allOpts := allClientOpts(config.NumChannels, config.Compression, opts...)
-    endpointClientOpts = append(endpointClientOpts, allOpts...)
+		endpointClientOpts = append(endpointClientOpts, allOpts...)
 		primaryConn, err = gtransport.DialPool(ctx, allOpts...)
 		if err != nil {
 			return nil, err
