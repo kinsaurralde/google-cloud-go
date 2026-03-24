@@ -1,7 +1,7 @@
 {
   "clientLibrary": {
     "name": "cloud.google.com/go/vectorsearch/apiv1",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "language": "GO",
     "apis": [
       {
@@ -1333,6 +1333,52 @@
         {
           "start": 18,
           "end": 51,
+          "type": "FULL"
+        }
+      ]
+    },
+    {
+      "regionTag": "vectorsearch_v1_generated_VectorSearchService_ExportDataObjects_sync",
+      "title": "vectorsearch ExportDataObjects Sample",
+      "description": "ExportDataObjects initiates a Long-Running Operation to export DataObjects from a Collection.",
+      "file": "Client/ExportDataObjects/main.go",
+      "language": "GO",
+      "clientMethod": {
+        "shortName": "ExportDataObjects",
+        "fullName": "google.cloud.vectorsearch.v1.Client.ExportDataObjects",
+        "parameters": [
+          {
+            "type": "context.Context",
+            "name": "ctx"
+          },
+          {
+            "type": "vectorsearchpb.ExportDataObjectsRequest",
+            "name": "req"
+          },
+          {
+            "type": "...gax.CallOption",
+            "name": "opts"
+          }
+        ],
+        "resultType": "ExportDataObjectsOperation",
+        "client": {
+          "shortName": "Client",
+          "fullName": "google.cloud.vectorsearch.v1.Client"
+        },
+        "method": {
+          "shortName": "ExportDataObjects",
+          "fullName": "google.cloud.vectorsearch.v1.VectorSearchService.ExportDataObjects",
+          "service": {
+            "shortName": "VectorSearchService",
+            "fullName": "google.cloud.vectorsearch.v1.VectorSearchService"
+          }
+        }
+      },
+      "origin": "API_DEFINITION",
+      "segments": [
+        {
+          "start": 18,
+          "end": 58,
           "type": "FULL"
         }
       ]

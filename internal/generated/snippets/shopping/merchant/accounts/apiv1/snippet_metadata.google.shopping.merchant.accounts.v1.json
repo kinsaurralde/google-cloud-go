@@ -1,7 +1,7 @@
 {
   "clientLibrary": {
     "name": "cloud.google.com/go/shopping/merchant/accounts/apiv1",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "language": "GO",
     "apis": [
       {
@@ -455,6 +455,52 @@
         "method": {
           "shortName": "CreateAndConfigureAccount",
           "fullName": "google.shopping.merchant.accounts.v1.AccountsService.CreateAndConfigureAccount",
+          "service": {
+            "shortName": "AccountsService",
+            "fullName": "google.shopping.merchant.accounts.v1.AccountsService"
+          }
+        }
+      },
+      "origin": "API_DEFINITION",
+      "segments": [
+        {
+          "start": 18,
+          "end": 53,
+          "type": "FULL"
+        }
+      ]
+    },
+    {
+      "regionTag": "merchantapi_v1_generated_AccountsService_CreateTestAccount_sync",
+      "title": "merchantapi CreateTestAccount Sample",
+      "description": "CreateTestAccount creates a Merchant Center test account.\n\nTest accounts are intended for development and testing purposes, such as\nvalidating API integrations or new feature behavior.\n\nKey characteristics and limitations of test accounts: \n- Immutable Type: A test account cannot be converted into a regular\n(live) Merchant Center account. Likewise, a regular account cannot be\nconverted into a test account.\n- Non-Serving Products: Any products, offers, or data created within a\ntest account will not be published or made visible to end-users on any\nGoogle surfaces. They are strictly for testing environments.\n- Separate Environment: Test accounts operate in a sandbox-like manner,\nisolated from live serving and real user traffic.",
+      "file": "Client/CreateTestAccount/main.go",
+      "language": "GO",
+      "clientMethod": {
+        "shortName": "CreateTestAccount",
+        "fullName": "google.shopping.merchant.accounts.v1.Client.CreateTestAccount",
+        "parameters": [
+          {
+            "type": "context.Context",
+            "name": "ctx"
+          },
+          {
+            "type": "accountspb.CreateTestAccountRequest",
+            "name": "req"
+          },
+          {
+            "type": "...gax.CallOption",
+            "name": "opts"
+          }
+        ],
+        "resultType": "*accountspb.Account",
+        "client": {
+          "shortName": "Client",
+          "fullName": "google.shopping.merchant.accounts.v1.Client"
+        },
+        "method": {
+          "shortName": "CreateTestAccount",
+          "fullName": "google.shopping.merchant.accounts.v1.AccountsService.CreateTestAccount",
           "service": {
             "shortName": "AccountsService",
             "fullName": "google.shopping.merchant.accounts.v1.AccountsService"
@@ -3227,7 +3273,7 @@
     {
       "regionTag": "merchantapi_v1_generated_UserService_DeleteUser_sync",
       "title": "merchantapi DeleteUser Sample",
-      "description": "DeleteUser deletes a Merchant Center account user. Executing this method requires\nadmin access. The user to be deleted can't be the last admin user of that\naccount. Also a user is protected from deletion if it\nis managed by Business Manager\"",
+      "description": "DeleteUser deletes a Merchant Center account user. Executing this method requires\nadmin access. The user to be deleted can't be the last admin user of that\naccount.",
       "file": "UserClient/DeleteUser/main.go",
       "language": "GO",
       "clientMethod": {
