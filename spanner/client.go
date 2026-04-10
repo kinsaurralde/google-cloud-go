@@ -528,9 +528,11 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	var pool gtransport.ConnPool
 	var endpointClientOpts []option.ClientOption
 
-	isFallbackEnabled := true // Default behavior when unset
+	isFallbackEnabled := true
 	if val, ok := os.LookupEnv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK"); ok {
-		isFallbackEnabled, _ = strconv.ParseBool(val)
+		if b, err := strconv.ParseBool(val); err == nil {
+			isFallbackEnabled = b
+		}
 	}
 	if gme != nil {
 		// Use GCPMultiEndpoint if provided.
