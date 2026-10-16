@@ -111,7 +111,10 @@ type sessionClient struct {
 	callOptions          *vkit.CallOptions
 	otConfig             *openTelemetryConfig
 	metricsTracerFactory *builtinMetricsTracerFactory
-	channelIDMap         map[*grpc.ClientConn]uint64
+	channelIDMap  map[*grpc.ClientConn]uint64
+	slotMap       map[*grpc.ClientConn]*fallbackSlot
+	fallbackState *fallbackState
+	dialFallback  func(context.Context) (gtransport.ConnPool, error)
 
 	// baseClientOpts holds the client options used for creating endpoint-specific
 	// gRPC connections in location-aware routing.
@@ -141,6 +144,8 @@ func newSessionClient(connPool gtransport.ConnPool, database, userAgent string, 
 		batchTimeout:         batchTimeout,
 		logger:               logger,
 		callOptions:          callOptions,
+		channelIDMap:         make(map[*grpc.ClientConn]uint64),
+		slotMap:              make(map[*grpc.ClientConn]*fallbackSlot),
 
 		nthClient:  nthClient,
 		nthRequest: new(atomic.Uint32),
@@ -156,7 +161,13 @@ func (sc *sessionClient) close() error {
 		defer sc.mu.Unlock()
 
 		sc.closed = true
-		err = sc.connPool.Close()
+		for _, slot := range sc.slotMap {
+			slot.Close()
+		}
+		sc.fallbackState.close()
+		if sc.connPool != nil {
+			err = sc.connPool.Close()
+		}
 	}()
 	return err
 }
@@ -293,8 +304,6 @@ func (sc *sessionClient) nextClient() (spannerClient, error) {
 	if _, ok := sc.connPool.(*gmeWrapper); ok {
 		// Pass GCPMultiEndpoint as a pool.
 		clientOpt = gtransport.WithConnPool(sc.connPool)
-	} else if _, ok := sc.connPool.(*fallbackWrapper); ok {
-		clientOpt = gtransport.WithConnPool(sc.connPool)
 	} else {
 		// Pick a grpc.ClientConn from a regular pool.
 		conn := sc.connPool.Conn()
@@ -310,9 +319,18 @@ func (sc *sessionClient) nextClient() (spannerClient, error) {
 			}
 			channelID = uint64(len(sc.channelIDMap)) + 1
 			sc.channelIDMap[conn] = channelID
+			if sc.fallbackState != nil {
+				if sc.slotMap == nil {
+					sc.slotMap = make(map[*grpc.ClientConn]*fallbackSlot)
+				}
+				sc.slotMap[conn] = newFallbackSlot(conn, sc.fallbackState, sc.dialFallback)
+			}
 		}
 
 		clientOpt = option.WithGRPCConn(conn)
+		if slot, ok := sc.slotMap[conn]; ok {
+			clientOpt = gtransport.WithConnPool(slot)
+		}
 	}
 	client, err := newGRPCSpannerClient(context.Background(), sc, channelID, clientOpt)
 	if err != nil {

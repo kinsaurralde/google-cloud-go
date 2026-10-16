@@ -86,6 +86,8 @@ var (
 		metricLabelKeyToChannelName:   true,
 		metricLabelKeyChannelName:     true,
 		metricLabelKeyStatusCode:      true,
+		metricLabelKeySuccess:         true,
+		metricLabelKeyReason:          true,
 	}
 
 	errShutdown = fmt.Errorf("exporter is shutdown")
