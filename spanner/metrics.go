@@ -464,6 +464,7 @@ func builtInMeterProviderOptions(project, compression string, clientAttributes [
 		))
 	}
 	skippedEEFMetrics := []string{
+		metricNameEEFProbeResult,
 		"eef.error_ratio",
 		"eef.current_channel",
 		"eef.channel_downtime",
@@ -477,7 +478,6 @@ func builtInMeterProviderOptions(project, compression string, clientAttributes [
 	eefMetricsToEnable := []string{
 		metricNameEEFFallbackCount,
 		metricNameEEFCallStatus,
-		metricNameEEFProbeResult,
 	}
 	for _, m := range eefMetricsToEnable {
 		views = append(views, sdkmetric.NewView(

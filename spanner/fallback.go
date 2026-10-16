@@ -35,7 +35,9 @@ import (
 	gtransport "google.golang.org/api/transport/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/alts"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -52,14 +54,23 @@ const (
 	defaultRecoveryProbeRPCTimeout = 10 * time.Second
 )
 
-// Test hooks for overriding period/dialer in unit tests.
+// Test hooks for overriding period/dialer/peer check in unit tests.
 var (
 	fallbackEvalPeriod      = defaultFallbackPeriod
 	recoveryProbeInterval   = defaultRecoveryProbeInterval
 	recoveryMinProbes       = defaultRecoveryMinProbes
 	recoveryMinDuration     = defaultRecoveryMinDuration
 	dialFallbackCloudPathFn = gtransport.DialPool
+	isDirectPathPeerFn      = isDirectPathPeer
 )
+
+func isDirectPathPeer(p *peer.Peer) bool {
+	if p == nil || p.AuthInfo == nil {
+		return false
+	}
+	_, isALTS := p.AuthInfo.(alts.AuthInfo)
+	return isALTS
+}
 
 func isFallbackRecoveryEnabled() bool {
 	val, ok := os.LookupEnv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY")
@@ -186,36 +197,36 @@ func (s *fallbackState) unregisterSlot(slot *fallbackSlot) {
 		return
 	}
 	s.slotsMu.Lock()
-	for i, candidate := range s.slots {
-		if candidate == slot {
+	anyOnDirectPath := false
+	for i := len(s.slots) - 1; i >= 0; i-- {
+		if s.slots[i] == slot {
 			s.slots = append(s.slots[:i], s.slots[i+1:]...)
-			break
+			continue
+		}
+		if !s.slots[i].slotInFallback.Load() {
+			anyOnDirectPath = true
 		}
 	}
-	s.updateFallbackFlagLocked()
+	if s.enableRecovery && (len(s.slots) == 0 || anyOnDirectPath) {
+		if s.isInFallback.Swap(false) {
+			s.primaryFailures.Store(0)
+			s.primarySuccesses.Store(0)
+		}
+	}
 	s.slotsMu.Unlock()
 }
 
+// onSlotRecovered is called when any slot recovers to DirectPath. It resets the
+// shared fallback flag on the first recovered slot so rateCheck is re-armed for
+// subsequent DirectPath traffic and newly scaled-up DCP channels start on DirectPath.
 func (s *fallbackState) onSlotRecovered() {
 	if s == nil {
 		return
 	}
-	s.slotsMu.Lock()
-	s.updateFallbackFlagLocked()
-	s.slotsMu.Unlock()
-}
-
-func (s *fallbackState) updateFallbackFlagLocked() {
-	if !s.enableRecovery {
-		return
+	if s.isInFallback.Swap(false) {
+		s.primaryFailures.Store(0)
+		s.primarySuccesses.Store(0)
 	}
-	for _, slot := range s.slots {
-		if slot.slotInFallback.Load() {
-			s.isInFallback.Store(true)
-			return
-		}
-	}
-	s.isInFallback.Store(false)
 }
 
 func (s *fallbackState) isErroneousCode(code codes.Code) bool {
@@ -226,16 +237,13 @@ func (s *fallbackState) isErroneousCode(code codes.Code) bool {
 func (s *fallbackState) reportPrimaryStatus(slot *fallbackSlot, err error) {
 	code := status.Code(err)
 	s.recordCallMetric(s.primaryChannelName, code)
+	if slot != nil && slot.isInFallback() {
+		return
+	}
 	if s.isErroneousCode(code) {
 		s.primaryFailures.Add(1)
-		if slot != nil && s.enableRecovery {
-			slot.slotFailures.Add(1)
-		}
 	} else {
 		s.primarySuccesses.Add(1)
-		if slot != nil && s.enableRecovery {
-			slot.slotSuccesses.Add(1)
-		}
 	}
 }
 
@@ -277,33 +285,22 @@ func (s *fallbackState) recordProbeMetric(channelName, result string) {
 func (s *fallbackState) rateCheck() {
 	failures := s.primaryFailures.Swap(0)
 	successes := s.primarySuccesses.Swap(0)
+	if s.isInFallback.Load() {
+		return
+	}
 	total := failures + successes
-
-	if !s.isInFallback.Load() {
-		if total > 0 && int(failures) >= s.minFailedCalls {
-			errorRate := float32(failures) / float32(total)
-			if errorRate >= s.errorRateThreshold {
-				if s.isInFallback.CompareAndSwap(false, true) {
-					s.recordFallbackSwitchMetric(s.primaryChannelName, s.fallbackChannelName)
-					s.slotsMu.Lock()
-					slots := append([]*fallbackSlot(nil), s.slots...)
-					s.slotsMu.Unlock()
-					for _, slot := range slots {
-						slot.enterFallback()
-					}
-					return
+	if total > 0 && int(failures) >= s.minFailedCalls {
+		errorRate := float32(failures) / float32(total)
+		if errorRate >= s.errorRateThreshold {
+			if s.isInFallback.CompareAndSwap(false, true) {
+				s.recordFallbackSwitchMetric(s.primaryChannelName, s.fallbackChannelName)
+				s.slotsMu.Lock()
+				slots := append([]*fallbackSlot(nil), s.slots...)
+				s.slotsMu.Unlock()
+				for _, slot := range slots {
+					slot.enterFallback()
 				}
 			}
-		}
-	}
-
-	// If recovery is enabled, check any active DirectPath slots for individual fallback.
-	if s.enableRecovery {
-		s.slotsMu.Lock()
-		slots := append([]*fallbackSlot(nil), s.slots...)
-		s.slotsMu.Unlock()
-		for _, slot := range slots {
-			slot.checkSlotRate()
 		}
 	}
 }
@@ -341,10 +338,8 @@ type fallbackSlot struct {
 	mu     sync.Mutex
 	closed bool
 
-	// Per-slot fallback and recovery state (Hybrid Option 2)
+	// Per-slot fallback and recovery state
 	slotInFallback    atomic.Bool
-	slotSuccesses     atomic.Uint64
-	slotFailures      atomic.Uint64
 	consecutiveProbes int
 	firstProbeSuccess time.Time
 	probeCancel       context.CancelFunc
@@ -380,32 +375,11 @@ func (s *fallbackSlot) isInFallback() bool {
 }
 
 func (s *fallbackSlot) enterFallback() {
-	s.slotSuccesses.Store(0)
-	s.slotFailures.Store(0)
 	if !s.slotInFallback.CompareAndSwap(false, true) {
 		return
 	}
 	if s.state != nil && s.state.enableRecovery {
 		s.startProbing()
-	}
-}
-
-func (s *fallbackSlot) checkSlotRate() {
-	failures := s.slotFailures.Swap(0)
-	successes := s.slotSuccesses.Swap(0)
-	if s.slotInFallback.Load() {
-		return
-	}
-	total := failures + successes
-	if total > 0 && int(failures) >= s.state.minFailedCalls {
-		errorRate := float32(failures) / float32(total)
-		if errorRate >= s.state.errorRateThreshold {
-			if s.slotInFallback.CompareAndSwap(false, true) {
-				s.state.isInFallback.Store(true)
-				s.state.recordFallbackSwitchMetric(s.state.primaryChannelName, s.state.fallbackChannelName)
-				s.startProbing()
-			}
-		}
 	}
 }
 
@@ -449,6 +423,10 @@ func (s *fallbackSlot) probeOnce(ctx context.Context) bool {
 	s.state.recordProbeMetric(s.state.primaryChannelName, reason)
 
 	s.mu.Lock()
+	if s.closed || !s.slotInFallback.Load() {
+		s.mu.Unlock()
+		return true
+	}
 	if reason != "" {
 		s.consecutiveProbes = 0
 		s.firstProbeSuccess = time.Time{}
@@ -468,8 +446,6 @@ func (s *fallbackSlot) probeOnce(ctx context.Context) bool {
 			s.probeCancel()
 			s.probeCancel = nil
 		}
-		s.slotSuccesses.Store(0)
-		s.slotFailures.Store(0)
 		recovered := s.slotInFallback.CompareAndSwap(true, false)
 		s.mu.Unlock()
 		if recovered {
@@ -492,9 +468,13 @@ func (s *fallbackSlot) probeDirectPath(ctx context.Context) string {
 	probeCtx, cancel := context.WithTimeout(probeCtx, defaultRecoveryProbeRPCTimeout)
 	defer cancel()
 
+	var p peer.Peer
 	client := spannerpb.NewSpannerClient(s.primaryConn)
-	if _, err := client.GetSession(probeCtx, &spannerpb.GetSessionRequest{Name: sid}); err != nil {
+	if _, err := client.GetSession(probeCtx, &spannerpb.GetSessionRequest{Name: sid}, grpc.Peer(&p)); err != nil {
 		return status.Code(err).String()
+	}
+	if !isDirectPathPeerFn(&p) {
+		return "NOT_DIRECTPATH"
 	}
 	return ""
 }
@@ -520,6 +500,7 @@ func (s *fallbackSlot) Invoke(ctx context.Context, method string, args, reply an
 	if s.isInFallback() {
 		fallback, err := s.getOrDialFallback()
 		if err != nil {
+			s.state.reportFallbackStatus(err)
 			return err
 		}
 		err = fallback.Invoke(ctx, method, args, reply, opts...)
@@ -537,6 +518,7 @@ func (s *fallbackSlot) NewStream(ctx context.Context, desc *grpc.StreamDesc, met
 	if s.isInFallback() {
 		fallback, err := s.getOrDialFallback()
 		if err != nil {
+			s.state.reportFallbackStatus(err)
 			return nil, err
 		}
 		stream, err := fallback.NewStream(ctx, desc, method, opts...)

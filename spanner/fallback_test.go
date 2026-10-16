@@ -37,6 +37,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -377,13 +378,16 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 	origProbeInterval := recoveryProbeInterval
 	origMinProbes := recoveryMinProbes
 	origMinDuration := recoveryMinDuration
+	origPeerFn := isDirectPathPeerFn
 	recoveryProbeInterval = 5 * time.Millisecond
 	recoveryMinProbes = 3
 	recoveryMinDuration = 10 * time.Millisecond
+	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
 	defer func() {
 		recoveryProbeInterval = origProbeInterval
 		recoveryMinProbes = origMinProbes
 		recoveryMinDuration = origMinDuration
+		isDirectPathPeerFn = origPeerFn
 	}()
 
 	var dpBroken atomic.Bool
@@ -552,13 +556,16 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 	origProbeInterval := recoveryProbeInterval
 	origMinProbes := recoveryMinProbes
 	origMinDuration := recoveryMinDuration
+	origPeerFn := isDirectPathPeerFn
 	recoveryProbeInterval = 5 * time.Millisecond
 	recoveryMinProbes = 2
 	recoveryMinDuration = 5 * time.Millisecond
+	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
 	defer func() {
 		recoveryProbeInterval = origProbeInterval
 		recoveryMinProbes = origMinProbes
 		recoveryMinDuration = origMinDuration
+		isDirectPathPeerFn = origPeerFn
 	}()
 
 	var dpBroken atomic.Bool
@@ -708,13 +715,16 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 	origProbeInterval := recoveryProbeInterval
 	origMinProbes := recoveryMinProbes
 	origMinDuration := recoveryMinDuration
+	origPeerFn := isDirectPathPeerFn
 	recoveryProbeInterval = 3 * time.Millisecond
 	recoveryMinProbes = 2
 	recoveryMinDuration = 5 * time.Millisecond
+	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
 	defer func() {
 		recoveryProbeInterval = origProbeInterval
 		recoveryMinProbes = origMinProbes
 		recoveryMinDuration = origMinDuration
+		isDirectPathPeerFn = origPeerFn
 	}()
 
 	var dpBroken atomic.Bool
@@ -865,5 +875,161 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 	}
 	if dpCount.Load() == 0 || cpCount.Load() == 0 {
 		t.Fatalf("expected RPCs on both DirectPath (%d) and CloudPath (%d)", dpCount.Load(), cpCount.Load())
+	}
+}
+
+// TestEEF_RuleAndProbeEdgeCases covers the fallback decision rule edges and
+// per-slot probing edge cases:
+//  1. Error rate < 100% (e.g. 1 success + 1 failure) does not trip fallback.
+//  2. Probe with no session returns FailedPrecondition; probe over non-ALTS
+//     peer returns NOT_DIRECTPATH and resets consecutiveProbes.
+//  3. Per-slot independence: one slot can recover while another slot whose
+//     probes fail remains in fallback.
+func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
+	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
+
+	origProbeInterval := recoveryProbeInterval
+	origMinProbes := recoveryMinProbes
+	origMinDuration := recoveryMinDuration
+	origPeerFn := isDirectPathPeerFn
+	recoveryProbeInterval = time.Hour // disable background ticker so we drive probeOnce deterministically
+	recoveryMinProbes = 2
+	recoveryMinDuration = 0
+	defer func() {
+		recoveryProbeInterval = origProbeInterval
+		recoveryMinProbes = origMinProbes
+		recoveryMinDuration = origMinDuration
+		isDirectPathPeerFn = origPeerFn
+	}()
+
+	var slot2Broken atomic.Bool
+	dpServer1, opts1, teardown1 := testutil.NewMockedSpannerInMemTestServer(t)
+	defer teardown1()
+
+	dpGrpc2 := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if slot2Broken.Load() {
+				return nil, status.Error(codes.Unavailable, "slot2 DirectPath down")
+			}
+			return handler(ctx, req)
+		}),
+	)
+	sppb.RegisterSpannerServer(dpGrpc2, dpServer1.TestSpanner)
+	dpLis2, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go dpGrpc2.Serve(dpLis2)
+	defer dpGrpc2.Stop()
+
+	ctx := context.Background()
+	pool1, err := gtransport.DialPool(ctx, opts1...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool1.Close()
+	pool2, err := gtransport.DialPool(ctx,
+		option.WithEndpoint(dpLis2.Addr().String()),
+		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool2.Close()
+
+	state := newFallbackState("projects/p/instances/i/databases/d", nil)
+	defer state.close()
+
+	dialFallback := func(ctx context.Context) (gtransport.ConnPool, error) {
+		return gtransport.DialPool(ctx, opts1...)
+	}
+	slot1 := newFallbackSlot(pool1, state, dialFallback)
+	defer slot1.Close()
+	slot2 := newFallbackSlot(pool2, state, dialFallback)
+	defer slot2.Close()
+
+	// 1. Error rate < 100% (1 success + 1 failure = 50%) must not trip fallback.
+	state.reportPrimaryStatus(slot1, nil)
+	state.reportPrimaryStatus(slot1, status.Error(codes.Unavailable, "transient"))
+	state.rateCheck()
+	if state.inFallback() || slot1.isInFallback() || slot2.isInFallback() {
+		t.Fatal("expected 50% error rate not to trip fallback")
+	}
+
+	// 2. 100% error rate (0 successes + 1 failure) trips fallback on both slots.
+	state.reportPrimaryStatus(slot1, status.Error(codes.Unavailable, "outage"))
+	state.rateCheck()
+	if !state.inFallback() || !slot1.isInFallback() || !slot2.isInFallback() {
+		t.Fatal("expected 100% error rate to trip fallback on all slots")
+	}
+
+	// 3. Probe with no session yet fails with FailedPrecondition.
+	if got := slot1.probeDirectPath(ctx); got != codes.FailedPrecondition.String() {
+		t.Fatalf("probeDirectPath with no session = %q, want %q", got, codes.FailedPrecondition.String())
+	}
+
+	// Create a real session on dpServer1 to use as probeSession.
+	sessClient := sppb.NewSpannerClient(pool1)
+	sess, err := sessClient.CreateSession(ctx, &sppb.CreateSessionRequest{
+		Database: "projects/p/instances/i/databases/d",
+		Session:  &sppb.Session{Multiplexed: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.setProbeSession(sess.GetName())
+
+	// 4. Probe over non-ALTS peer returns NOT_DIRECTPATH and resets consecutiveProbes.
+	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
+	if slot1.probeOnce(ctx) {
+		t.Fatal("expected first probe not to recover when minProbes=2")
+	}
+	if slot1.consecutiveProbes != 1 {
+		t.Fatalf("slot1.consecutiveProbes = %d, want 1", slot1.consecutiveProbes)
+	}
+	isDirectPathPeerFn = func(*peer.Peer) bool { return false }
+	if got := slot1.probeDirectPath(ctx); got != "NOT_DIRECTPATH" {
+		t.Fatalf("probeDirectPath without ALTS = %q, want NOT_DIRECTPATH", got)
+	}
+	slot1.probeOnce(ctx)
+	if slot1.consecutiveProbes != 0 {
+		t.Fatalf("slot1.consecutiveProbes after NOT_DIRECTPATH = %d, want 0", slot1.consecutiveProbes)
+	}
+
+	// 5. Per-slot independence & first-slot recovery reset: slot1 recovers after
+	// 2 ALTS probes while slot2 stays in fallback, and state.inFallback() resets
+	// on the first recovered slot so rateCheck() is re-armed.
+	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
+	slot2Broken.Store(true)
+	slot1.probeOnce(ctx)
+	if !slot1.probeOnce(ctx) {
+		t.Fatal("expected slot1 to recover on 2nd consecutive probe")
+	}
+	slot2.probeOnce(ctx)
+	if slot1.isInFallback() {
+		t.Fatal("expected slot1 to have recovered to DirectPath")
+	}
+	if !slot2.isInFallback() {
+		t.Fatal("expected slot2 to remain in fallback while its probes fail")
+	}
+	if state.inFallback() {
+		t.Fatal("expected state.inFallback() to reset to false on first recovered slot")
+	}
+
+	// 6. New fallback event during partial recovery: slot2 passes 1 probe (1/2),
+	// then slot1 fails 100% on DirectPath -> rateCheck() puts slot1 back into
+	// fallback without resetting slot2's in-progress probe count.
+	slot2Broken.Store(false)
+	if slot2.probeOnce(ctx) || slot2.consecutiveProbes != 1 {
+		t.Fatalf("expected slot2 to be at 1/2 probes, got %d", slot2.consecutiveProbes)
+	}
+	state.reportPrimaryStatus(slot1, status.Error(codes.Unavailable, "outage again"))
+	state.rateCheck()
+	if !state.inFallback() || !slot1.isInFallback() || !slot2.isInFallback() {
+		t.Fatal("expected rateCheck during partial recovery to put slot1 back into fallback")
+	}
+	if slot2.consecutiveProbes != 1 {
+		t.Fatalf("expected slot2 probe progress to be preserved (1), got %d", slot2.consecutiveProbes)
 	}
 }
