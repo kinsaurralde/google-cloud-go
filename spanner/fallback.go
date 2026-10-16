@@ -186,13 +186,36 @@ func (s *fallbackState) unregisterSlot(slot *fallbackSlot) {
 		return
 	}
 	s.slotsMu.Lock()
-	defer s.slotsMu.Unlock()
 	for i, candidate := range s.slots {
 		if candidate == slot {
 			s.slots = append(s.slots[:i], s.slots[i+1:]...)
+			break
+		}
+	}
+	s.updateFallbackFlagLocked()
+	s.slotsMu.Unlock()
+}
+
+func (s *fallbackState) onSlotRecovered() {
+	if s == nil {
+		return
+	}
+	s.slotsMu.Lock()
+	s.updateFallbackFlagLocked()
+	s.slotsMu.Unlock()
+}
+
+func (s *fallbackState) updateFallbackFlagLocked() {
+	if !s.enableRecovery {
+		return
+	}
+	for _, slot := range s.slots {
+		if slot.slotInFallback.Load() {
+			s.isInFallback.Store(true)
 			return
 		}
 	}
+	s.isInFallback.Store(false)
 }
 
 func (s *fallbackState) isErroneousCode(code codes.Code) bool {
@@ -268,13 +291,13 @@ func (s *fallbackState) rateCheck() {
 					for _, slot := range slots {
 						slot.enterFallback()
 					}
+					return
 				}
 			}
 		}
-		return
 	}
 
-	// If recovery is enabled, check any recovered slots for individual re-fallback.
+	// If recovery is enabled, check any active DirectPath slots for individual fallback.
 	if s.enableRecovery {
 		s.slotsMu.Lock()
 		slots := append([]*fallbackSlot(nil), s.slots...)
@@ -294,14 +317,15 @@ func (s *fallbackState) close() {
 // newFallbackDialer returns a function that dials a single CloudPath connection
 // from the client's options with DirectPath disabled.
 func newFallbackDialer(compression string, opts []option.ClientOption) func(context.Context) (gtransport.ConnPool, error) {
-	cloudOpts := append([]option.ClientOption{}, buildClientOpts(1, compression, false, opts...)...)
-	cloudOpts = append(cloudOpts,
-		internaloption.EnableDirectPath(false),
-		option.WithGRPCConnectionPool(1),
-	)
+	baseOpts := append([]option.ClientOption(nil), opts...)
 	dialFn := dialFallbackCloudPathFn
 	return func(ctx context.Context) (gtransport.ConnPool, error) {
-		return dialFn(ctx, cloudOpts...)
+		cloudOpts := buildClientOpts(1, compression, false, baseOpts...)
+		cloudOpts = append(cloudOpts,
+			internaloption.EnableDirectPath(false),
+			option.WithGRPCConnectionPool(1),
+		)
+		return dialFn(ctx, cloudOpts[:len(cloudOpts):len(cloudOpts)]...)
 	}
 }
 
@@ -377,6 +401,7 @@ func (s *fallbackSlot) checkSlotRate() {
 		errorRate := float32(failures) / float32(total)
 		if errorRate >= s.state.errorRateThreshold {
 			if s.slotInFallback.CompareAndSwap(false, true) {
+				s.state.isInFallback.Store(true)
 				s.state.recordFallbackSwitchMetric(s.state.primaryChannelName, s.state.fallbackChannelName)
 				s.startProbing()
 			}
@@ -424,10 +449,10 @@ func (s *fallbackSlot) probeOnce(ctx context.Context) bool {
 	s.state.recordProbeMetric(s.state.primaryChannelName, reason)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if reason != "" {
 		s.consecutiveProbes = 0
 		s.firstProbeSuccess = time.Time{}
+		s.mu.Unlock()
 		return false
 	}
 
@@ -445,34 +470,29 @@ func (s *fallbackSlot) probeOnce(ctx context.Context) bool {
 		}
 		s.slotSuccesses.Store(0)
 		s.slotFailures.Store(0)
-		if s.slotInFallback.CompareAndSwap(true, false) {
+		recovered := s.slotInFallback.CompareAndSwap(true, false)
+		s.mu.Unlock()
+		if recovered {
+			s.state.onSlotRecovered()
 			s.state.recordFallbackSwitchMetric(s.state.fallbackChannelName, s.state.primaryChannelName)
 		}
 		return true
 	}
+	s.mu.Unlock()
 	return false
 }
 
 func (s *fallbackSlot) probeDirectPath(ctx context.Context) string {
+	v := s.state.probeSession.Load()
+	sid, _ := v.(string)
+	if sid == "" {
+		return codes.FailedPrecondition.String()
+	}
 	probeCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs(resourcePrefixHeader, s.state.database))
 	probeCtx, cancel := context.WithTimeout(probeCtx, defaultRecoveryProbeRPCTimeout)
 	defer cancel()
 
 	client := spannerpb.NewSpannerClient(s.primaryConn)
-	v := s.state.probeSession.Load()
-	sid, _ := v.(string)
-	if sid == "" {
-		sess, err := client.CreateSession(probeCtx, &spannerpb.CreateSessionRequest{
-			Database: s.state.database,
-			Session:  &spannerpb.Session{Multiplexed: true},
-		})
-		if err != nil {
-			return status.Code(err).String()
-		}
-		s.state.setProbeSession(sess.GetName())
-		return ""
-	}
-
 	if _, err := client.GetSession(probeCtx, &spannerpb.GetSessionRequest{Name: sid}); err != nil {
 		return status.Code(err).String()
 	}

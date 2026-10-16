@@ -557,8 +557,8 @@ func createDCPConnPool(
 	sc := newSessionClient(nil, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions)
 	sc.metricsTracerFactory = metricsTracerFactory
 	if isFallbackEnabled {
-		var mp metric.MeterProvider
-		if metricsTracerFactory != nil {
+		mp := config.OpenTelemetryMeterProvider
+		if mp == nil && metricsTracerFactory != nil {
 			mp = metricsTracerFactory.meterProvider
 		}
 		sc.fallbackState = newFallbackState(database, mp)
@@ -770,8 +770,8 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	if sc == nil {
 		sc = newSessionClient(pool, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions)
 		if isFallbackEnabled && isDirectPathEnabled && gme == nil {
-			var mp metric.MeterProvider
-			if metricsTracerFactory != nil {
+			mp := config.OpenTelemetryMeterProvider
+			if mp == nil && metricsTracerFactory != nil {
 				mp = metricsTracerFactory.meterProvider
 			}
 			sc.fallbackState = newFallbackState(database, mp)

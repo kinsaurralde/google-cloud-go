@@ -441,19 +441,14 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 
 	ctx := context.Background()
 	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
-		DisableNativeMetrics: true,
-		NumChannels:          1,
+		DisableNativeMetrics:       true,
+		NumChannels:                1,
+		OpenTelemetryMeterProvider: mp,
 	}, clientOpts...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-
-	// Attach our test MeterProvider to fallbackState so we can inspect eef.* metrics.
-	meter := mp.Meter(grpcGcpMetricMeterName)
-	client.sc.fallbackState.fallbackCounter, _ = meter.Int64Counter(metricNameEEFFallbackCount)
-	client.sc.fallbackState.callCounter, _ = meter.Int64Counter(metricNameEEFCallStatus)
-	client.sc.fallbackState.probeResultCounter, _ = meter.Int64Counter(metricNameEEFProbeResult)
 
 	runQuery := func() error {
 		iter := client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
@@ -537,5 +532,338 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 		if !seenMetrics[wantName] {
 			t.Fatalf("expected metric %q to be recorded, got %v", wantName, seenMetrics)
 		}
+	}
+}
+
+// TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown verifies the full
+// interaction between Dynamic Channel Pooling and EEF fallback/recovery:
+//  1. When fallback trips, scaling up a new DCP channel while DirectPath is
+//     down succeeds because the new slot enters fallback immediately and primes
+//     over CloudPath.
+//  2. When DirectPath heals, both initial and scaled-up DCP slots recover to
+//     DirectPath and reset fallbackState.inFallback() to false.
+//  3. Subsequent DCP scale-up starts directly on DirectPath, and DCP scale-down
+//     cleanly closes and unregisters drained fallbackSlots.
+func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
+	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
+	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
+	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
+
+	origProbeInterval := recoveryProbeInterval
+	origMinProbes := recoveryMinProbes
+	origMinDuration := recoveryMinDuration
+	recoveryProbeInterval = 5 * time.Millisecond
+	recoveryMinProbes = 2
+	recoveryMinDuration = 5 * time.Millisecond
+	defer func() {
+		recoveryProbeInterval = origProbeInterval
+		recoveryMinProbes = origMinProbes
+		recoveryMinDuration = origMinDuration
+	}()
+
+	var dpBroken atomic.Bool
+	var dpRPCs, cpRPCs atomic.Int32
+
+	dpServer, clientOpts, dpTeardown := testutil.NewMockedSpannerInMemTestServer(
+		t,
+		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if dpBroken.Load() && !strings.HasSuffix(info.FullMethod, "CreateSession") {
+				return nil, status.Error(codes.Unavailable, "DirectPath down")
+			}
+			dpRPCs.Add(1)
+			return handler(ctx, req)
+		}),
+		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			if dpBroken.Load() {
+				return status.Error(codes.Unavailable, "DirectPath down")
+			}
+			dpRPCs.Add(1)
+			return handler(srv, ss)
+		}),
+	)
+	defer dpTeardown()
+	addSelect1Result(dpServer)
+
+	cpGrpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			cpRPCs.Add(1)
+			return handler(ctx, req)
+		}),
+		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			cpRPCs.Add(1)
+			return handler(srv, ss)
+		}),
+	)
+	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
+	cpLis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go cpGrpcServer.Serve(cpLis)
+	defer cpGrpcServer.Stop()
+
+	origDial := dialFallbackCloudPathFn
+	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
+		return gtransport.DialPool(ctx, append(opts,
+			option.WithEndpoint(cpLis.Addr().String()),
+			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+			option.WithoutAuthentication(),
+		)...)
+	}
+	defer func() { dialFallbackCloudPathFn = origDial }()
+
+	ctx := context.Background()
+	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
+		DisableNativeMetrics: true,
+		DynamicChannelPoolConfig: DynamicChannelPoolConfig{
+			DCPEnabled:                           true,
+			DCPInitialChannels:                   1,
+			DCPMinChannels:                       1,
+			DCPMaxChannels:                       4,
+			DCPMinRPCPerChannel:                  1,
+			DCPMaxRPCPerChannel:                  2,
+			DCPScaleUpCooldown:                   1 * time.Millisecond,
+			DCPDrainIdleGrace:                    1 * time.Millisecond,
+			DCPDownscaleConsecutiveLowLoadChecks: 1,
+		},
+	}, clientOpts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Wait for multiplexed session to populate primeSession and probeSession.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.sc.dynamicPool.hasPrimeSession() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 1. Break DirectPath and trip fallback on the initial DCP slot.
+	dpBroken.Store(true)
+	client.sc.fallbackState.primarySuccesses.Store(0)
+	client.sc.fallbackState.primaryFailures.Store(1)
+	client.sc.fallbackState.rateCheck()
+
+	// 2. Simulate high load while DirectPath is down and trigger DCP scale-up.
+	// The new DCP channel must enter fallback immediately and prime over CloudPath.
+	dcp := client.sc.dynamicPool
+	entries := dcp.getEntries()
+	entries[0].unaryLoad.Store(10)
+	dcp.totalRPCLoad.Store(10)
+	dcp.scaleUp()
+	entries[0].unaryLoad.Store(0)
+	dcp.totalRPCLoad.Store(0)
+
+	if got := dcp.Num(); got < 2 {
+		t.Fatalf("DCP Num() after scaleUp in fallback = %d, want >= 2", got)
+	}
+	if cpRPCs.Load() == 0 {
+		t.Fatal("expected DCP channel priming during fallback to execute over CloudPath")
+	}
+
+	// 3. Heal DirectPath and wait for all DCP slots to recover via GetSession probes.
+	dpBroken.Store(false)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !client.sc.fallbackState.inFallback() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if client.sc.fallbackState.inFallback() {
+		t.Fatal("expected fallbackState.inFallback() to reset to false after all DCP slots recovered")
+	}
+
+	// 4. Trigger DCP scale-down and verify the drained slot is unregistered from fallbackState.
+	dcp.removeEntries(dcp.Num() - 1)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client.sc.fallbackState.slotsMu.Lock()
+		nSlots := len(client.sc.fallbackState.slots)
+		client.sc.fallbackState.slotsMu.Unlock()
+		if nSlots == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client.sc.fallbackState.slotsMu.Lock()
+	nSlots := len(client.sc.fallbackState.slots)
+	client.sc.fallbackState.slotsMu.Unlock()
+	if nSlots != 1 {
+		t.Fatalf("registered fallbackSlots after DCP scale-down = %d, want 1", nSlots)
+	}
+}
+
+// TestEEF_Stress_ConcurrentFlappingAndTransactions stress-tests concurrent
+// ReadWriteTransactions and single-use streaming queries across 4 slots while
+// DirectPath repeatedly flaps between healthy and broken with recovery enabled.
+func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
+	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
+	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
+	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
+
+	origProbeInterval := recoveryProbeInterval
+	origMinProbes := recoveryMinProbes
+	origMinDuration := recoveryMinDuration
+	recoveryProbeInterval = 3 * time.Millisecond
+	recoveryMinProbes = 2
+	recoveryMinDuration = 5 * time.Millisecond
+	defer func() {
+		recoveryProbeInterval = origProbeInterval
+		recoveryMinProbes = origMinProbes
+		recoveryMinDuration = origMinDuration
+	}()
+
+	var dpBroken atomic.Bool
+	var dpCount, cpCount atomic.Int32
+
+	dpServer, clientOpts, dpTeardown := testutil.NewMockedSpannerInMemTestServer(
+		t,
+		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if dpBroken.Load() && !strings.HasSuffix(info.FullMethod, "CreateSession") {
+				return nil, status.Error(codes.Unavailable, "DirectPath down")
+			}
+			dpCount.Add(1)
+			return handler(ctx, req)
+		}),
+		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			if dpBroken.Load() {
+				return status.Error(codes.Unavailable, "DirectPath down")
+			}
+			dpCount.Add(1)
+			return handler(srv, ss)
+		}),
+	)
+	defer dpTeardown()
+
+	cpGrpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			cpCount.Add(1)
+			return handler(ctx, req)
+		}),
+		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			cpCount.Add(1)
+			return handler(srv, ss)
+		}),
+	)
+	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
+	cpLis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go cpGrpcServer.Serve(cpLis)
+	defer cpGrpcServer.Stop()
+
+	origDial := dialFallbackCloudPathFn
+	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
+		return gtransport.DialPool(ctx, append(opts,
+			option.WithEndpoint(cpLis.Addr().String()),
+			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+			option.WithoutAuthentication(),
+		)...)
+	}
+	defer func() { dialFallbackCloudPathFn = origDial }()
+
+	ctx := context.Background()
+	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
+		DisableNativeMetrics: true,
+		NumChannels:          4,
+	}, clientOpts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Warm up multiplexed session and all 4 slots.
+	for i := 0; i < 4; i++ {
+		iter := client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
+		for {
+			_, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				iter.Stop()
+				t.Fatalf("warmup query failed: %v", err)
+			}
+		}
+		iter.Stop()
+	}
+
+	stopCh := make(chan struct{})
+	var flapDone sync.WaitGroup
+	flapDone.Add(1)
+	go func() {
+		defer flapDone.Done()
+		for cycle := 0; cycle < 3; cycle++ {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			// Break DirectPath and immediately trip fallback so workers switch to CloudPath.
+			dpBroken.Store(true)
+			client.sc.fallbackState.primarySuccesses.Store(0)
+			client.sc.fallbackState.primaryFailures.Store(4)
+			client.sc.fallbackState.rateCheck()
+			time.Sleep(15 * time.Millisecond)
+
+			// Heal DirectPath and let the background probe loops recover the slots.
+			dpBroken.Store(false)
+			time.Sleep(25 * time.Millisecond)
+		}
+	}()
+
+	const numWorkers = 12
+	const opsPerWorker = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, numWorkers*opsPerWorker)
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for op := 0; op < opsPerWorker; op++ {
+				if (workerID+op)%2 == 0 {
+					_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *ReadWriteTransaction) error {
+						_, err := txn.Update(ctx, Statement{SQL: testutil.UpdateBarSetFoo})
+						return err
+					})
+					if err != nil {
+						errCh <- err
+						return
+					}
+				} else {
+					iter := client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
+					for {
+						_, err := iter.Next()
+						if err == iterator.Done {
+							break
+						}
+						if err != nil {
+							iter.Stop()
+							errCh <- err
+							return
+						}
+					}
+					iter.Stop()
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(stopCh)
+	flapDone.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent worker failed during DirectPath flapping: %v", err)
+	}
+	if dpCount.Load() == 0 || cpCount.Load() == 0 {
+		t.Fatalf("expected RPCs on both DirectPath (%d) and CloudPath (%d)", dpCount.Load(), cpCount.Load())
 	}
 }
