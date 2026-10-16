@@ -557,12 +557,7 @@ func createDCPConnPool(
 	sc := newSessionClient(nil, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions)
 	sc.metricsTracerFactory = metricsTracerFactory
 	if isFallbackEnabled {
-		mp := config.OpenTelemetryMeterProvider
-		if mp == nil && metricsTracerFactory != nil {
-			mp = metricsTracerFactory.meterProvider
-		}
-		sc.fallbackState = newFallbackState(database, mp)
-		sc.dialFallback = newFallbackDialer(config.Compression, dcpOpts)
+		sc.initFallback(database, config.Compression, config.OpenTelemetryMeterProvider, metricsTracerFactory, dcpOpts)
 	}
 	dial := func(dialCtx context.Context) (gtransport.ConnPool, error) {
 		conn, err := gtransport.DialPool(dialCtx, allClientOpts(1, config.Compression, config.EnableDirectAccess, dcpOpts...)...)
@@ -770,12 +765,7 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	if sc == nil {
 		sc = newSessionClient(pool, database, config.UserAgent, sessionLabels, config.DatabaseRole, config.DisableRouteToLeader, md, config.BatchTimeout, config.Logger, config.CallOptions)
 		if isFallbackEnabled && isDirectPathEnabled && gme == nil {
-			mp := config.OpenTelemetryMeterProvider
-			if mp == nil && metricsTracerFactory != nil {
-				mp = metricsTracerFactory.meterProvider
-			}
-			sc.fallbackState = newFallbackState(database, mp)
-			sc.dialFallback = newFallbackDialer(config.Compression, opts)
+			sc.initFallback(database, config.Compression, config.OpenTelemetryMeterProvider, metricsTracerFactory, opts)
 		}
 	}
 

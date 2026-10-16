@@ -81,39 +81,32 @@ func isFallbackRecoveryEnabled() bool {
 	return err == nil && b
 }
 
-// fallbackState is shared by every fallbackSlot in a client. It replaces
-// GCPFallback's decision and keeps its rule and metrics.
+// fallbackState tracks client-wide DirectPath health and metrics across all fallbackSlots.
 type fallbackState struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	isInFallback     atomic.Bool
-	primarySuccesses atomic.Uint64 // reset every period
+	primarySuccesses atomic.Uint64
 	primaryFailures  atomic.Uint64
 
-	// Same rule as GCPFallback options
-	erroneousCodes     map[codes.Code]struct{} // DEADLINE_EXCEEDED, UNAVAILABLE, UNAUTHENTICATED
-	errorRateThreshold float32                 // 1.0
-	minFailedCalls     int                     // 1
-	period             time.Duration           // 3 minutes
-
-	// Recovery configuration (guarded by GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY)
+	erroneousCodes      map[codes.Code]struct{}
+	errorRateThreshold  float32
+	minFailedCalls      int
+	period              time.Duration
 	enableRecovery      bool
 	probeInterval       time.Duration
 	minRecoveryProbes   int
 	minRecoveryDuration time.Duration
 	database            string
-	probeSession        atomic.Value // string (multiplexed session name)
+	probeSession        atomic.Value // string
 
 	slotsMu sync.Mutex
 	slots   []*fallbackSlot
 
-	// Same metrics as GCPFallback, on the "grpc-gcp-go" meter
-	fallbackCounter     metric.Int64Counter // eef.fallback_count
-	callCounter         metric.Int64Counter // eef.call_status
-	probeResultCounter  metric.Int64Counter // eef.probe_result
-	primaryChannelName  string              // "primary"
-	fallbackChannelName string              // "fallback"
+	fallbackCounter    metric.Int64Counter
+	callCounter        metric.Int64Counter
+	probeResultCounter metric.Int64Counter
 }
 
 func newFallbackState(database string, mp metric.MeterProvider) *fallbackState {
@@ -134,8 +127,6 @@ func newFallbackState(database string, mp metric.MeterProvider) *fallbackState {
 		minRecoveryProbes:   recoveryMinProbes,
 		minRecoveryDuration: recoveryMinDuration,
 		database:            database,
-		primaryChannelName:  defaultFallbackPrimaryChannelName,
-		fallbackChannelName: defaultFallbackFallbackChannelName,
 	}
 	if mp != nil {
 		meter := mp.Meter(grpcGcpMetricMeterName, metric.WithInstrumentationVersion(internal.Version))
@@ -193,9 +184,6 @@ func (s *fallbackState) registerSlot(slot *fallbackSlot) {
 }
 
 func (s *fallbackState) unregisterSlot(slot *fallbackSlot) {
-	if s == nil {
-		return
-	}
 	s.slotsMu.Lock()
 	anyOnDirectPath := false
 	for i := len(s.slots) - 1; i >= 0; i-- {
@@ -208,21 +196,18 @@ func (s *fallbackState) unregisterSlot(slot *fallbackSlot) {
 		}
 	}
 	if s.enableRecovery && (len(s.slots) == 0 || anyOnDirectPath) {
-		if s.isInFallback.Swap(false) {
-			s.primaryFailures.Store(0)
-			s.primarySuccesses.Store(0)
-		}
+		s.resetFallback()
 	}
 	s.slotsMu.Unlock()
 }
 
-// onSlotRecovered is called when any slot recovers to DirectPath. It resets the
-// shared fallback flag on the first recovered slot so rateCheck is re-armed for
-// subsequent DirectPath traffic and newly scaled-up DCP channels start on DirectPath.
+// onSlotRecovered resets the shared fallback flag when a slot recovers so
+// rateCheck is re-armed for DirectPath traffic and new DCP channels start on DirectPath.
 func (s *fallbackState) onSlotRecovered() {
-	if s == nil {
-		return
-	}
+	s.resetFallback()
+}
+
+func (s *fallbackState) resetFallback() {
 	if s.isInFallback.Swap(false) {
 		s.primaryFailures.Store(0)
 		s.primarySuccesses.Store(0)
@@ -236,8 +221,8 @@ func (s *fallbackState) isErroneousCode(code codes.Code) bool {
 
 func (s *fallbackState) reportPrimaryStatus(slot *fallbackSlot, err error) {
 	code := status.Code(err)
-	s.recordCallMetric(s.primaryChannelName, code)
-	if slot != nil && slot.isInFallback() {
+	s.recordCallMetric(defaultFallbackPrimaryChannelName, code)
+	if slot.isInFallback() {
 		return
 	}
 	if s.isErroneousCode(code) {
@@ -248,8 +233,7 @@ func (s *fallbackState) reportPrimaryStatus(slot *fallbackSlot, err error) {
 }
 
 func (s *fallbackState) reportFallbackStatus(err error) {
-	code := status.Code(err)
-	s.recordCallMetric(s.fallbackChannelName, code)
+	s.recordCallMetric(defaultFallbackFallbackChannelName, status.Code(err))
 }
 
 func (s *fallbackState) recordCallMetric(channelName string, code codes.Code) {
@@ -280,8 +264,6 @@ func (s *fallbackState) recordProbeMetric(channelName, result string) {
 	}
 }
 
-// rateCheck runs every period and switches slots to CloudPath if the error rate
-// threshold is reached.
 func (s *fallbackState) rateCheck() {
 	failures := s.primaryFailures.Swap(0)
 	successes := s.primarySuccesses.Swap(0)
@@ -289,18 +271,19 @@ func (s *fallbackState) rateCheck() {
 		return
 	}
 	total := failures + successes
-	if total > 0 && int(failures) >= s.minFailedCalls {
-		errorRate := float32(failures) / float32(total)
-		if errorRate >= s.errorRateThreshold {
-			if s.isInFallback.CompareAndSwap(false, true) {
-				s.recordFallbackSwitchMetric(s.primaryChannelName, s.fallbackChannelName)
-				s.slotsMu.Lock()
-				slots := append([]*fallbackSlot(nil), s.slots...)
-				s.slotsMu.Unlock()
-				for _, slot := range slots {
-					slot.enterFallback()
-				}
-			}
+	if total == 0 || int(failures) < s.minFailedCalls {
+		return
+	}
+	if float32(failures)/float32(total) < s.errorRateThreshold {
+		return
+	}
+	if s.isInFallback.CompareAndSwap(false, true) {
+		s.recordFallbackSwitchMetric(defaultFallbackPrimaryChannelName, defaultFallbackFallbackChannelName)
+		s.slotsMu.Lock()
+		slots := append([]*fallbackSlot(nil), s.slots...)
+		s.slotsMu.Unlock()
+		for _, slot := range slots {
+			slot.enterFallback()
 		}
 	}
 }
@@ -311,8 +294,14 @@ func (s *fallbackState) close() {
 	}
 }
 
-// newFallbackDialer returns a function that dials a single CloudPath connection
-// from the client's options with DirectPath disabled.
+func (sc *sessionClient) initFallback(database, compression string, mp metric.MeterProvider, metricsTracerFactory *builtinMetricsTracerFactory, opts []option.ClientOption) {
+	if mp == nil && metricsTracerFactory != nil {
+		mp = metricsTracerFactory.meterProvider
+	}
+	sc.fallbackState = newFallbackState(database, mp)
+	sc.dialFallback = newFallbackDialer(compression, opts)
+}
+
 func newFallbackDialer(compression string, opts []option.ClientOption) func(context.Context) (gtransport.ConnPool, error) {
 	baseOpts := append([]option.ClientOption(nil), opts...)
 	dialFn := dialFallbackCloudPathFn
@@ -326,19 +315,18 @@ func newFallbackDialer(compression string, opts []option.ClientOption) func(cont
 	}
 }
 
-// fallbackSlot sends each call over DirectPath (primary) or CloudPath (fallback).
-// It implements gtransport.ConnPool, so it can be used in place of a connection.
+// fallbackSlot routes RPCs over DirectPath (primary) or CloudPath (fallback)
+// for a single channel slot.
 type fallbackSlot struct {
 	primaryConn  grpc.ClientConnInterface
-	primaryPool  gtransport.ConnPool // non-nil when owned by this slot (e.g. DCP)
-	fallbackConn gtransport.ConnPool // dialed on first use
+	primaryPool  gtransport.ConnPool
+	fallbackConn gtransport.ConnPool
 	dialFallback func(context.Context) (gtransport.ConnPool, error)
-	state        *fallbackState // shared by every slot in the client
+	state        *fallbackState
 
 	mu     sync.Mutex
 	closed bool
 
-	// Per-slot fallback and recovery state
 	slotInFallback    atomic.Bool
 	consecutiveProbes int
 	firstProbeSuccess time.Time
@@ -358,16 +346,11 @@ func newFallbackSlot(primary grpc.ClientConnInterface, state *fallbackState, dia
 		dialFallback: dialFallback,
 		state:        state,
 	}
-	if state != nil {
-		state.registerSlot(slot)
-	}
+	state.registerSlot(slot)
 	return slot
 }
 
 func (s *fallbackSlot) isInFallback() bool {
-	if s.state == nil {
-		return false
-	}
 	if s.state.enableRecovery {
 		return s.slotInFallback.Load()
 	}
@@ -378,7 +361,7 @@ func (s *fallbackSlot) enterFallback() {
 	if !s.slotInFallback.CompareAndSwap(false, true) {
 		return
 	}
-	if s.state != nil && s.state.enableRecovery {
+	if s.state.enableRecovery {
 		s.startProbing()
 	}
 }
@@ -420,7 +403,7 @@ func (s *fallbackSlot) probeOnce(ctx context.Context) bool {
 		return true
 	}
 	reason := s.probeDirectPath(ctx)
-	s.state.recordProbeMetric(s.state.primaryChannelName, reason)
+	s.state.recordProbeMetric(defaultFallbackPrimaryChannelName, reason)
 
 	s.mu.Lock()
 	if s.closed || !s.slotInFallback.Load() {
@@ -450,7 +433,7 @@ func (s *fallbackSlot) probeOnce(ctx context.Context) bool {
 		s.mu.Unlock()
 		if recovered {
 			s.state.onSlotRecovered()
-			s.state.recordFallbackSwitchMetric(s.state.fallbackChannelName, s.state.primaryChannelName)
+			s.state.recordFallbackSwitchMetric(defaultFallbackFallbackChannelName, defaultFallbackPrimaryChannelName)
 		}
 		return true
 	}
@@ -508,9 +491,7 @@ func (s *fallbackSlot) Invoke(ctx context.Context, method string, args, reply an
 		return err
 	}
 	err := s.primaryConn.Invoke(ctx, method, args, reply, opts...)
-	if s.state != nil {
-		s.state.reportPrimaryStatus(s, err)
-	}
+	s.state.reportPrimaryStatus(s, err)
 	return err
 }
 
@@ -533,13 +514,8 @@ func (s *fallbackSlot) NewStream(ctx context.Context, desc *grpc.StreamDesc, met
 	}
 	stream, err := s.primaryConn.NewStream(ctx, desc, method, opts...)
 	if err != nil {
-		if s.state != nil {
-			s.state.reportPrimaryStatus(s, err)
-		}
+		s.state.reportPrimaryStatus(s, err)
 		return nil, err
-	}
-	if s.state == nil {
-		return stream, nil
 	}
 	return &fallbackMonitoredStream{
 		ClientStream: stream,

@@ -320,9 +320,6 @@ func (sc *sessionClient) nextClient() (spannerClient, error) {
 			channelID = uint64(len(sc.channelIDMap)) + 1
 			sc.channelIDMap[conn] = channelID
 			if sc.fallbackState != nil {
-				if sc.slotMap == nil {
-					sc.slotMap = make(map[*grpc.ClientConn]*fallbackSlot)
-				}
 				sc.slotMap[conn] = newFallbackSlot(conn, sc.fallbackState, sc.dialFallback)
 			}
 		}

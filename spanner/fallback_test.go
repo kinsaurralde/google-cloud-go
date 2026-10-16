@@ -54,9 +54,64 @@ func parseChannelIDFromHeader(md metadata.MD) uint64 {
 	return ch
 }
 
-// TestEEF_ReadWriteTransaction_ChannelAffinity verifies that with DirectPath and EEF
-// enabled, all RPCs within a single ReadWriteTransaction stay pinned to the same
-// non-zero channel slot (Stage 2).
+func overrideRecoveryConfigForTest(t *testing.T, interval time.Duration, minProbes int, minDuration time.Duration, peerFn func(*peer.Peer) bool) {
+	t.Helper()
+	origProbeInterval := recoveryProbeInterval
+	origMinProbes := recoveryMinProbes
+	origMinDuration := recoveryMinDuration
+	origPeerFn := isDirectPathPeerFn
+	recoveryProbeInterval = interval
+	recoveryMinProbes = minProbes
+	recoveryMinDuration = minDuration
+	if peerFn != nil {
+		isDirectPathPeerFn = peerFn
+	}
+	t.Cleanup(func() {
+		recoveryProbeInterval = origProbeInterval
+		recoveryMinProbes = origMinProbes
+		recoveryMinDuration = origMinDuration
+		isDirectPathPeerFn = origPeerFn
+	})
+}
+
+func startCloudPathTestServer(t *testing.T, spannerSrv sppb.SpannerServer, opts ...grpc.ServerOption) (string, *atomic.Int32) {
+	t.Helper()
+	cpGrpcServer := grpc.NewServer(opts...)
+	sppb.RegisterSpannerServer(cpGrpcServer, spannerSrv)
+	cpLis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go cpGrpcServer.Serve(cpLis)
+	t.Cleanup(cpGrpcServer.Stop)
+
+	var cloudDials atomic.Int32
+	origDial := dialFallbackCloudPathFn
+	dialFallbackCloudPathFn = func(ctx context.Context, dialOpts ...option.ClientOption) (gtransport.ConnPool, error) {
+		cloudDials.Add(1)
+		return gtransport.DialPool(ctx, append(dialOpts,
+			option.WithEndpoint(cpLis.Addr().String()),
+			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+			option.WithoutAuthentication(),
+		)...)
+	}
+	t.Cleanup(func() { dialFallbackCloudPathFn = origDial })
+	return cpLis.Addr().String(), &cloudDials
+}
+
+func drainRowIterator(iter *RowIterator) error {
+	defer iter.Stop()
+	for {
+		_, err := iter.Next()
+		if err == iterator.Done {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
 func TestEEF_ReadWriteTransaction_ChannelAffinity(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
@@ -76,18 +131,9 @@ func TestEEF_ReadWriteTransaction_ChannelAffinity(t *testing.T) {
 	ctx := context.Background()
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *ReadWriteTransaction) error {
 		for i := 0; i < 4; i++ {
-			iter := txn.Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
-			for {
-				_, err := iter.Next()
-				if err == iterator.Done {
-					break
-				}
-				if err != nil {
-					iter.Stop()
-					return err
-				}
+			if err := drainRowIterator(txn.Query(ctx, Statement{SQL: testutil.SelectFooFromBar})); err != nil {
+				return err
 			}
-			iter.Stop()
 		}
 		return nil
 	})
@@ -113,11 +159,6 @@ func TestEEF_ReadWriteTransaction_ChannelAffinity(t *testing.T) {
 	}
 }
 
-// TestEEF_ReadWriteTransaction_MidTxFallback verifies that:
-// 1. CloudPath is NOT dialed at startup before fallback occurs.
-// 2. When DirectPath fails mid-transaction and fallback trips, the in-flight
-//    ReadWriteTransaction switches to CloudPath on the same slot and preserves
-//    its channelID for Commit (Stage 3).
 func TestEEF_ReadWriteTransaction_MidTxFallback(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
@@ -156,7 +197,7 @@ func TestEEF_ReadWriteTransaction_MidTxFallback(t *testing.T) {
 	)
 	defer dpTeardown()
 
-	cpGrpcServer := grpc.NewServer(
+	_, cloudDials := startCloudPathTestServer(t, dpServer.TestSpanner,
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if md, ok := metadata.FromIncomingContext(ctx); ok {
 				mu.Lock()
@@ -174,25 +215,6 @@ func TestEEF_ReadWriteTransaction_MidTxFallback(t *testing.T) {
 			return handler(srv, ss)
 		}),
 	)
-	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
-	cpLis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go cpGrpcServer.Serve(cpLis)
-	defer cpGrpcServer.Stop()
-
-	var cloudDials atomic.Int32
-	origDial := dialFallbackCloudPathFn
-	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
-		cloudDials.Add(1)
-		return gtransport.DialPool(ctx, append(opts,
-			option.WithEndpoint(cpLis.Addr().String()),
-			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
-			option.WithoutAuthentication(),
-		)...)
-	}
-	defer func() { dialFallbackCloudPathFn = origDial }()
 
 	ctx := context.Background()
 	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
@@ -209,41 +231,15 @@ func TestEEF_ReadWriteTransaction_MidTxFallback(t *testing.T) {
 	}
 
 	_, err = client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *ReadWriteTransaction) error {
-		// Step 1: First query runs on DirectPath and establishes the transaction on a slot.
-		iter := txn.Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
-		for {
-			_, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				iter.Stop()
-				return err
-			}
+		if err := drainRowIterator(txn.Query(ctx, Statement{SQL: testutil.SelectFooFromBar})); err != nil {
+			return err
 		}
-		iter.Stop()
-
-		// Step 2: Simulate DirectPath failing and fallback window tripping mid-transaction.
 		if !client.sc.fallbackState.inFallback() {
 			client.sc.fallbackState.primarySuccesses.Store(0)
 			client.sc.fallbackState.primaryFailures.Store(1)
 			client.sc.fallbackState.rateCheck()
 		}
-
-		// Step 3: Second query + Commit run on the slot's lazily-dialed CloudPath connection.
-		iter2 := txn.Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
-		for {
-			_, err := iter2.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				iter2.Stop()
-				return err
-			}
-		}
-		iter2.Stop()
-		return nil
+		return drainRowIterator(txn.Query(ctx, Statement{SQL: testutil.SelectFooFromBar}))
 	})
 	if err != nil {
 		t.Fatalf("ReadWriteTransaction across mid-tx fallback failed: %v", err)
@@ -269,9 +265,6 @@ func TestEEF_ReadWriteTransaction_MidTxFallback(t *testing.T) {
 	}
 }
 
-// TestEEF_DynamicChannelPool_FallbackSlot verifies that Dynamic Channel Pooling
-// wraps its connections in fallbackSlots sharing sc.fallbackState and keeps
-// transactions on the same DCP entry across fallback.
 func TestEEF_DynamicChannelPool_FallbackSlot(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
@@ -292,7 +285,7 @@ func TestEEF_DynamicChannelPool_FallbackSlot(t *testing.T) {
 	)
 	defer dpTeardown()
 
-	cpGrpcServer := grpc.NewServer(
+	startCloudPathTestServer(t, dpServer.TestSpanner,
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if md, ok := metadata.FromIncomingContext(ctx); ok {
 				mu.Lock()
@@ -302,23 +295,6 @@ func TestEEF_DynamicChannelPool_FallbackSlot(t *testing.T) {
 			return handler(ctx, req)
 		}),
 	)
-	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
-	cpLis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go cpGrpcServer.Serve(cpLis)
-	defer cpGrpcServer.Stop()
-
-	origDial := dialFallbackCloudPathFn
-	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
-		return gtransport.DialPool(ctx, append(opts,
-			option.WithEndpoint(cpLis.Addr().String()),
-			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
-			option.WithoutAuthentication(),
-		)...)
-	}
-	defer func() { dialFallbackCloudPathFn = origDial }()
 
 	ctx := context.Background()
 	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
@@ -364,31 +340,12 @@ func TestEEF_DynamicChannelPool_FallbackSlot(t *testing.T) {
 	}
 }
 
-// TestEEF_PerSlotProbingAndRecovery verifies Phase 3 of the design doc:
-// when GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY=true, slots enter
-// fallback together, probe their DirectPath connection using GetSession on the
-// client's multiplexed session, emit eef.probe_result / eef.fallback_count /
-// eef.call_status metrics, and recover back to DirectPath after reaching the
-// probe threshold.
 func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
 	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
 
-	origProbeInterval := recoveryProbeInterval
-	origMinProbes := recoveryMinProbes
-	origMinDuration := recoveryMinDuration
-	origPeerFn := isDirectPathPeerFn
-	recoveryProbeInterval = 5 * time.Millisecond
-	recoveryMinProbes = 3
-	recoveryMinDuration = 10 * time.Millisecond
-	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
-	defer func() {
-		recoveryProbeInterval = origProbeInterval
-		recoveryMinProbes = origMinProbes
-		recoveryMinDuration = origMinDuration
-		isDirectPathPeerFn = origPeerFn
-	}()
+	overrideRecoveryConfigForTest(t, 5*time.Millisecond, 3, 10*time.Millisecond, func(*peer.Peer) bool { return true })
 
 	var dpBroken atomic.Bool
 	var dpQueries, cpQueries atomic.Int32
@@ -413,7 +370,7 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 	)
 	defer dpTeardown()
 
-	cpGrpcServer := grpc.NewServer(
+	startCloudPathTestServer(t, dpServer.TestSpanner,
 		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			if strings.HasSuffix(info.FullMethod, "ExecuteStreamingSql") {
 				cpQueries.Add(1)
@@ -421,23 +378,6 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 			return handler(srv, ss)
 		}),
 	)
-	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
-	cpLis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go cpGrpcServer.Serve(cpLis)
-	defer cpGrpcServer.Stop()
-
-	origDial := dialFallbackCloudPathFn
-	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
-		return gtransport.DialPool(ctx, append(opts,
-			option.WithEndpoint(cpLis.Addr().String()),
-			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
-			option.WithoutAuthentication(),
-		)...)
-	}
-	defer func() { dialFallbackCloudPathFn = origDial }()
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -455,20 +395,9 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 	defer client.Close()
 
 	runQuery := func() error {
-		iter := client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
-		defer iter.Stop()
-		for {
-			_, err := iter.Next()
-			if err == iterator.Done {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-		}
+		return drainRowIterator(client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar}))
 	}
 
-	// 1. Healthy DirectPath query succeeds and ensures multiplexed session is ready.
 	if err := runQuery(); err != nil {
 		t.Fatalf("initial DirectPath query failed: %v", err)
 	}
@@ -476,7 +405,6 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 		t.Fatalf("counts before fallback: dp=%d cp=%d, want dp=1 cp=0", dpQueries.Load(), cpQueries.Load())
 	}
 
-	// Wait for the background multiplexed session creation to populate probeSession.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if v, _ := client.sc.fallbackState.probeSession.Load().(string); v != "" {
@@ -485,12 +413,9 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// 2. Break DirectPath, fail a query, and trigger rateCheck -> fallback to CloudPath.
 	dpBroken.Store(true)
 	failCtx, failCancel := context.WithTimeout(ctx, 30*time.Millisecond)
-	iter := client.Single().Query(failCtx, Statement{SQL: testutil.SelectFooFromBar})
-	_, _ = iter.Next()
-	iter.Stop()
+	_ = drainRowIterator(client.Single().Query(failCtx, Statement{SQL: testutil.SelectFooFromBar}))
 	failCancel()
 	client.sc.fallbackState.primarySuccesses.Store(0)
 	client.sc.fallbackState.rateCheck()
@@ -502,7 +427,6 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 		t.Fatal("expected query to route to CloudPath while DirectPath is down")
 	}
 
-	// 3. Heal DirectPath and wait for the slot's GetSession probes to recover it.
 	dpBroken.Store(false)
 	dpBeforeRecovery := dpQueries.Load()
 	recovered := false
@@ -521,7 +445,6 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 		t.Fatal("slot did not recover to DirectPath after DirectPath healed")
 	}
 
-	// Verify eef.fallback_count, eef.call_status, and eef.probe_result metrics were recorded.
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &rm); err != nil {
 		t.Fatal(err)
@@ -539,34 +462,12 @@ func TestEEF_PerSlotProbingAndRecovery(t *testing.T) {
 	}
 }
 
-// TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown verifies the full
-// interaction between Dynamic Channel Pooling and EEF fallback/recovery:
-//  1. When fallback trips, scaling up a new DCP channel while DirectPath is
-//     down succeeds because the new slot enters fallback immediately and primes
-//     over CloudPath.
-//  2. When DirectPath heals, both initial and scaled-up DCP slots recover to
-//     DirectPath and reset fallbackState.inFallback() to false.
-//  3. Subsequent DCP scale-up starts directly on DirectPath, and DCP scale-down
-//     cleanly closes and unregisters drained fallbackSlots.
 func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
 	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
 
-	origProbeInterval := recoveryProbeInterval
-	origMinProbes := recoveryMinProbes
-	origMinDuration := recoveryMinDuration
-	origPeerFn := isDirectPathPeerFn
-	recoveryProbeInterval = 5 * time.Millisecond
-	recoveryMinProbes = 2
-	recoveryMinDuration = 5 * time.Millisecond
-	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
-	defer func() {
-		recoveryProbeInterval = origProbeInterval
-		recoveryMinProbes = origMinProbes
-		recoveryMinDuration = origMinDuration
-		isDirectPathPeerFn = origPeerFn
-	}()
+	overrideRecoveryConfigForTest(t, 5*time.Millisecond, 2, 5*time.Millisecond, func(*peer.Peer) bool { return true })
 
 	var dpBroken atomic.Bool
 	var dpRPCs, cpRPCs atomic.Int32
@@ -591,7 +492,7 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 	defer dpTeardown()
 	addSelect1Result(dpServer)
 
-	cpGrpcServer := grpc.NewServer(
+	startCloudPathTestServer(t, dpServer.TestSpanner,
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			cpRPCs.Add(1)
 			return handler(ctx, req)
@@ -601,23 +502,6 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 			return handler(srv, ss)
 		}),
 	)
-	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
-	cpLis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go cpGrpcServer.Serve(cpLis)
-	defer cpGrpcServer.Stop()
-
-	origDial := dialFallbackCloudPathFn
-	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
-		return gtransport.DialPool(ctx, append(opts,
-			option.WithEndpoint(cpLis.Addr().String()),
-			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
-			option.WithoutAuthentication(),
-		)...)
-	}
-	defer func() { dialFallbackCloudPathFn = origDial }()
 
 	ctx := context.Background()
 	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
@@ -639,7 +523,6 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Wait for multiplexed session to populate primeSession and probeSession.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if client.sc.dynamicPool.hasPrimeSession() {
@@ -648,14 +531,11 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// 1. Break DirectPath and trip fallback on the initial DCP slot.
 	dpBroken.Store(true)
 	client.sc.fallbackState.primarySuccesses.Store(0)
 	client.sc.fallbackState.primaryFailures.Store(1)
 	client.sc.fallbackState.rateCheck()
 
-	// 2. Simulate high load while DirectPath is down and trigger DCP scale-up.
-	// The new DCP channel must enter fallback immediately and prime over CloudPath.
 	dcp := client.sc.dynamicPool
 	entries := dcp.getEntries()
 	entries[0].unaryLoad.Store(10)
@@ -671,7 +551,6 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 		t.Fatal("expected DCP channel priming during fallback to execute over CloudPath")
 	}
 
-	// 3. Heal DirectPath and wait for all DCP slots to recover via GetSession probes.
 	dpBroken.Store(false)
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -681,10 +560,9 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if client.sc.fallbackState.inFallback() {
-		t.Fatal("expected fallbackState.inFallback() to reset to false after all DCP slots recovered")
+		t.Fatal("expected fallbackState.inFallback() to reset to false after DCP slots recovered")
 	}
 
-	// 4. Trigger DCP scale-down and verify the drained slot is unregistered from fallbackState.
 	dcp.removeEntries(dcp.Num() - 1)
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -704,28 +582,12 @@ func TestEEF_DCP_ScaleUpWhileInFallback_RecoverAndScaleDown(t *testing.T) {
 	}
 }
 
-// TestEEF_Stress_ConcurrentFlappingAndTransactions stress-tests concurrent
-// ReadWriteTransactions and single-use streaming queries across 4 slots while
-// DirectPath repeatedly flaps between healthy and broken with recovery enabled.
 func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "true")
 	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
 	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
 
-	origProbeInterval := recoveryProbeInterval
-	origMinProbes := recoveryMinProbes
-	origMinDuration := recoveryMinDuration
-	origPeerFn := isDirectPathPeerFn
-	recoveryProbeInterval = 3 * time.Millisecond
-	recoveryMinProbes = 2
-	recoveryMinDuration = 5 * time.Millisecond
-	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
-	defer func() {
-		recoveryProbeInterval = origProbeInterval
-		recoveryMinProbes = origMinProbes
-		recoveryMinDuration = origMinDuration
-		isDirectPathPeerFn = origPeerFn
-	}()
+	overrideRecoveryConfigForTest(t, 3*time.Millisecond, 2, 5*time.Millisecond, func(*peer.Peer) bool { return true })
 
 	var dpBroken atomic.Bool
 	var dpCount, cpCount atomic.Int32
@@ -749,7 +611,7 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 	)
 	defer dpTeardown()
 
-	cpGrpcServer := grpc.NewServer(
+	startCloudPathTestServer(t, dpServer.TestSpanner,
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			cpCount.Add(1)
 			return handler(ctx, req)
@@ -759,23 +621,6 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 			return handler(srv, ss)
 		}),
 	)
-	sppb.RegisterSpannerServer(cpGrpcServer, dpServer.TestSpanner)
-	cpLis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go cpGrpcServer.Serve(cpLis)
-	defer cpGrpcServer.Stop()
-
-	origDial := dialFallbackCloudPathFn
-	dialFallbackCloudPathFn = func(ctx context.Context, opts ...option.ClientOption) (gtransport.ConnPool, error) {
-		return gtransport.DialPool(ctx, append(opts,
-			option.WithEndpoint(cpLis.Addr().String()),
-			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
-			option.WithoutAuthentication(),
-		)...)
-	}
-	defer func() { dialFallbackCloudPathFn = origDial }()
 
 	ctx := context.Background()
 	client, err := NewClientWithConfig(ctx, "projects/p/instances/i/databases/d", ClientConfig{
@@ -787,20 +632,10 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Warm up multiplexed session and all 4 slots.
 	for i := 0; i < 4; i++ {
-		iter := client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
-		for {
-			_, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				iter.Stop()
-				t.Fatalf("warmup query failed: %v", err)
-			}
+		if err := drainRowIterator(client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})); err != nil {
+			t.Fatalf("warmup query failed: %v", err)
 		}
-		iter.Stop()
 	}
 
 	stopCh := make(chan struct{})
@@ -814,14 +649,12 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 				return
 			default:
 			}
-			// Break DirectPath and immediately trip fallback so workers switch to CloudPath.
 			dpBroken.Store(true)
 			client.sc.fallbackState.primarySuccesses.Store(0)
 			client.sc.fallbackState.primaryFailures.Store(4)
 			client.sc.fallbackState.rateCheck()
 			time.Sleep(15 * time.Millisecond)
 
-			// Heal DirectPath and let the background probe loops recover the slots.
 			dpBroken.Store(false)
 			time.Sleep(25 * time.Millisecond)
 		}
@@ -837,29 +670,18 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 		go func(workerID int) {
 			defer wg.Done()
 			for op := 0; op < opsPerWorker; op++ {
+				var err error
 				if (workerID+op)%2 == 0 {
-					_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *ReadWriteTransaction) error {
+					_, err = client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *ReadWriteTransaction) error {
 						_, err := txn.Update(ctx, Statement{SQL: testutil.UpdateBarSetFoo})
 						return err
 					})
-					if err != nil {
-						errCh <- err
-						return
-					}
 				} else {
-					iter := client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar})
-					for {
-						_, err := iter.Next()
-						if err == iterator.Done {
-							break
-						}
-						if err != nil {
-							iter.Stop()
-							errCh <- err
-							return
-						}
-					}
-					iter.Stop()
+					err = drainRowIterator(client.Single().Query(ctx, Statement{SQL: testutil.SelectFooFromBar}))
+				}
+				if err != nil {
+					errCh <- err
+					return
 				}
 			}
 		}(w)
@@ -878,29 +700,10 @@ func TestEEF_Stress_ConcurrentFlappingAndTransactions(t *testing.T) {
 	}
 }
 
-// TestEEF_RuleAndProbeEdgeCases covers the fallback decision rule edges and
-// per-slot probing edge cases:
-//  1. Error rate < 100% (e.g. 1 success + 1 failure) does not trip fallback.
-//  2. Probe with no session returns FailedPrecondition; probe over non-ALTS
-//     peer returns NOT_DIRECTPATH and resets consecutiveProbes.
-//  3. Per-slot independence: one slot can recover while another slot whose
-//     probes fail remains in fallback.
 func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
 	t.Setenv("GOOGLE_SPANNER_EXPERIMENTAL_GCP_FALLBACK_RECOVERY", "true")
 
-	origProbeInterval := recoveryProbeInterval
-	origMinProbes := recoveryMinProbes
-	origMinDuration := recoveryMinDuration
-	origPeerFn := isDirectPathPeerFn
-	recoveryProbeInterval = time.Hour // disable background ticker so we drive probeOnce deterministically
-	recoveryMinProbes = 2
-	recoveryMinDuration = 0
-	defer func() {
-		recoveryProbeInterval = origProbeInterval
-		recoveryMinProbes = origMinProbes
-		recoveryMinDuration = origMinDuration
-		isDirectPathPeerFn = origPeerFn
-	}()
+	overrideRecoveryConfigForTest(t, time.Hour, 2, 0, nil)
 
 	var slot2Broken atomic.Bool
 	dpServer1, opts1, teardown1 := testutil.NewMockedSpannerInMemTestServer(t)
@@ -949,7 +752,6 @@ func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
 	slot2 := newFallbackSlot(pool2, state, dialFallback)
 	defer slot2.Close()
 
-	// 1. Error rate < 100% (1 success + 1 failure = 50%) must not trip fallback.
 	state.reportPrimaryStatus(slot1, nil)
 	state.reportPrimaryStatus(slot1, status.Error(codes.Unavailable, "transient"))
 	state.rateCheck()
@@ -957,19 +759,16 @@ func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
 		t.Fatal("expected 50% error rate not to trip fallback")
 	}
 
-	// 2. 100% error rate (0 successes + 1 failure) trips fallback on both slots.
 	state.reportPrimaryStatus(slot1, status.Error(codes.Unavailable, "outage"))
 	state.rateCheck()
 	if !state.inFallback() || !slot1.isInFallback() || !slot2.isInFallback() {
 		t.Fatal("expected 100% error rate to trip fallback on all slots")
 	}
 
-	// 3. Probe with no session yet fails with FailedPrecondition.
 	if got := slot1.probeDirectPath(ctx); got != codes.FailedPrecondition.String() {
 		t.Fatalf("probeDirectPath with no session = %q, want %q", got, codes.FailedPrecondition.String())
 	}
 
-	// Create a real session on dpServer1 to use as probeSession.
 	sessClient := sppb.NewSpannerClient(pool1)
 	sess, err := sessClient.CreateSession(ctx, &sppb.CreateSessionRequest{
 		Database: "projects/p/instances/i/databases/d",
@@ -980,7 +779,6 @@ func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
 	}
 	state.setProbeSession(sess.GetName())
 
-	// 4. Probe over non-ALTS peer returns NOT_DIRECTPATH and resets consecutiveProbes.
 	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
 	if slot1.probeOnce(ctx) {
 		t.Fatal("expected first probe not to recover when minProbes=2")
@@ -997,9 +795,6 @@ func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
 		t.Fatalf("slot1.consecutiveProbes after NOT_DIRECTPATH = %d, want 0", slot1.consecutiveProbes)
 	}
 
-	// 5. Per-slot independence & first-slot recovery reset: slot1 recovers after
-	// 2 ALTS probes while slot2 stays in fallback, and state.inFallback() resets
-	// on the first recovered slot so rateCheck() is re-armed.
 	isDirectPathPeerFn = func(*peer.Peer) bool { return true }
 	slot2Broken.Store(true)
 	slot1.probeOnce(ctx)
@@ -1017,9 +812,6 @@ func TestEEF_RuleAndProbeEdgeCases(t *testing.T) {
 		t.Fatal("expected state.inFallback() to reset to false on first recovered slot")
 	}
 
-	// 6. New fallback event during partial recovery: slot2 passes 1 probe (1/2),
-	// then slot1 fails 100% on DirectPath -> rateCheck() puts slot1 back into
-	// fallback without resetting slot2's in-progress probe count.
 	slot2Broken.Store(false)
 	if slot2.probeOnce(ctx) || slot2.consecutiveProbes != 1 {
 		t.Fatalf("expected slot2 to be at 1/2 probes, got %d", slot2.consecutiveProbes)
