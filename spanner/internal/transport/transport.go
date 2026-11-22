@@ -91,15 +91,26 @@ func ResolveDirectPathEnabled(configEnableDirectAccess bool) bool {
 }
 
 // ResolveGCPFallbackEnabled resolves whether DirectPath-to-CloudPath fallback is enabled
-// via GOOGLE_SPANNER_ENABLE_GCP_FALLBACK.
+// via GOOGLE_SPANNER_ENABLE_GCP_FALLBACK. It defaults to true when unset or unparseable.
 func ResolveGCPFallbackEnabled() bool {
+	return resolveGCPFallbackEnabled(true)
+}
+
+// ResolveLegacyGCPFallbackEnabled resolves whether grpc-gcp-go's pool-level
+// GCPFallback is explicitly enabled via GOOGLE_SPANNER_ENABLE_GCP_FALLBACK=true
+// for the legacy static channel pool. It defaults to false when unset or unparseable.
+func ResolveLegacyGCPFallbackEnabled() bool {
+	return resolveGCPFallbackEnabled(false)
+}
+
+func resolveGCPFallbackEnabled(defaultVal bool) bool {
 	if envVal := os.Getenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK"); envVal != "" {
 		enabled, err := strconv.ParseBool(envVal)
 		if err == nil {
 			return enabled
 		}
 	}
-	return false
+	return defaultVal
 }
 
 // DefaultClientOptions combines the generated GAPIC default options, Spanner client

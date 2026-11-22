@@ -242,7 +242,7 @@ func TestFixedPoolDirectPathFallbackDefaults(t *testing.T) {
 		fallback     string
 		want         bool
 	}{
-		{name: "fallback is off by default", directAccess: "true", fallback: "", want: false},
+		{name: "fallback is on by default", directAccess: "true", fallback: "", want: true},
 		{name: "fallback enabled by environment", directAccess: "true", fallback: "true", want: true},
 		{name: "fallback disabled by environment", directAccess: "true", fallback: "false", want: false},
 		{name: "no fallback without DirectPath", directAccess: "false", fallback: "true", want: false},
@@ -776,6 +776,31 @@ func TestDirectPathFallbackOffWithEmulator(t *testing.T) {
 		t.Fatal("the emulator client has fallback state")
 	}
 	queryFooFromBar(t, client)
+}
+
+func TestDirectPathFallbackOffWithOmniAndExperimentalHost(t *testing.T) {
+	skipDialectRerun(t)
+	for _, tt := range []struct {
+		name   string
+		config ClientConfig
+	}{
+		{"omni", ClientConfig{Type: OMNI, UsePlainText: true}},
+		{"experimental host", ClientConfig{IsExperimentalHost: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			isolateChannelPoolEnv(t)
+			t.Setenv(experimentalLocationAPIEnvVar, "")
+			t.Setenv("SPANNER_EMULATOR_HOST", "")
+			t.Setenv(directAccessEnv, "true")
+			_, opts, teardown := NewMockedSpannerInMemTestServer(t)
+			t.Cleanup(teardown)
+			client := newDirectPathFallbackTestClient(t, tt.config, opts...)
+			if poolFallback(fixedPoolOf(t, client)) != nil {
+				t.Fatalf("%s client has fallback state", tt.name)
+			}
+			queryFooFromBar(t, client)
+		})
+	}
 }
 
 // A nil connection or pool option clears an earlier one, so the client dials

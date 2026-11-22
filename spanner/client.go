@@ -763,9 +763,14 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	var endpointClientOpts []option.ClientOption
 	var sc *sessionClient
 
-	// DirectPath to CloudPath fallback is disabled by default. Set
-	// GOOGLE_SPANNER_ENABLE_GCP_FALLBACK=true to enable it.
-	isFallbackEnabled := transport.ResolveGCPFallbackEnabled() && isDirectPathEnabled
+	// DirectPath to CloudPath fallback is enabled by default when DirectPath is
+	// enabled. Set GOOGLE_SPANNER_ENABLE_GCP_FALLBACK=false to disable it.
+	// The emulator, Omni, and experimental hosts have no DirectPath to fall back from.
+	isFallbackEnabled := transport.ResolveGCPFallbackEnabled() &&
+		isDirectPathEnabled &&
+		!emulatorEnabled &&
+		config.Type != OMNI &&
+		!config.IsExperimentalHost
 
 	isLegacyStaticChannelPoolEnabled := false
 	if val, ok := os.LookupEnv("GOOGLE_SPANNER_ENABLE_LEGACY_STATIC_CHANNEL_POOL"); ok {
@@ -810,8 +815,9 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 		// Use GCPMultiEndpoint if provided.
 		pool = &gmeWrapper{gme}
 		endpointClientOpts = append(endpointClientOpts, opts...)
-	} else if isLegacyStaticChannelPoolEnabled && isFallbackEnabled {
-		// The legacy static pool keeps grpc-gcp-go's GCPFallback.
+	} else if isLegacyStaticChannelPoolEnabled && isFallbackEnabled && transport.ResolveLegacyGCPFallbackEnabled() {
+		// The legacy static pool only enables grpc-gcp-go's GCPFallback when
+		// GOOGLE_SPANNER_ENABLE_GCP_FALLBACK is explicitly set to true.
 		pool, endpointClientOpts, err = createFallbackConnPool(ctx, config, hasNumChannelsConfig, metricsTracerFactory, opts...)
 		if err != nil {
 			return nil, err
@@ -831,8 +837,7 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 		if config.DynamicChannelPoolConfig.DCPEnabled && isExperimentalLocationAPIEnabledForConfig(config) {
 			logf(config.Logger, "spanner: DynamicChannelPoolConfig is ignored with location-aware routing; using a fixed-size channel pool")
 		}
-		// The emulator has no DirectPath to fall back from.
-		pool, sc, endpointClientOpts, err = createFixedConnPool(ctx, database, config, hasNumChannelsConfig, sessionLabels, md, metricsTracerFactory, isFallbackEnabled && !emulatorEnabled, opts...)
+		pool, sc, endpointClientOpts, err = createFixedConnPool(ctx, database, config, hasNumChannelsConfig, sessionLabels, md, metricsTracerFactory, isFallbackEnabled, opts...)
 		if err != nil {
 			return nil, err
 		}

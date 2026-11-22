@@ -133,13 +133,18 @@ func TestResolveDirectPathAndFallbackEnv(t *testing.T) {
 		t.Fatal("expected invalid GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS to evaluate to false via strconv.ParseBool")
 	}
 
-	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "")
-	if ResolveGCPFallbackEnabled() {
-		t.Fatal("expected ResolveGCPFallbackEnabled=false by default")
-	}
-	t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "true")
-	if !ResolveGCPFallbackEnabled() {
-		t.Fatal("expected ResolveGCPFallbackEnabled=true when env=true")
+	for _, tc := range []struct {
+		env        string
+		want       bool
+		wantLegacy bool
+	}{{"", true, false}, {"false", false, false}, {"true", true, true}, {"invalid-bool", true, false}} {
+		t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", tc.env)
+		if got := ResolveGCPFallbackEnabled(); got != tc.want {
+			t.Fatalf("ResolveGCPFallbackEnabled() with env=%q = %v, want %v", tc.env, got, tc.want)
+		}
+		if got := ResolveLegacyGCPFallbackEnabled(); got != tc.wantLegacy {
+			t.Fatalf("ResolveLegacyGCPFallbackEnabled() with env=%q = %v, want %v", tc.env, got, tc.wantLegacy)
+		}
 	}
 }
 

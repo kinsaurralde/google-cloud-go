@@ -37,6 +37,7 @@ func TestNewClientWithConfig_Characterization(t *testing.T) {
 
 	t.Run("static and fallback pool sizing and mismatch error chain", func(t *testing.T) {
 		t.Setenv("SPANNER_EMULATOR_HOST", "")
+		t.Setenv("GOOGLE_SPANNER_ENABLE_DIRECT_ACCESS", "")
 		t.Setenv("GOOGLE_SPANNER_ENABLE_GCP_FALLBACK", "")
 		_, client, teardown := setupMockedTestServerWithConfig(t, ClientConfig{
 			DisableNativeMetrics: true,

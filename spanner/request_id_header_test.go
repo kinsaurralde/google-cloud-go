@@ -1616,7 +1616,6 @@ func TestRequestIDHeader_SingleUseReadOnly_ExecuteStreamingSql_Unavailable(t *te
 }
 
 func TestRequestIDHeader_SingleUseReadOnly_ExecuteStreamingSql_InvalidArgument(t *testing.T) {
-	skipDirectPathTest(t)
 	t.Parallel()
 
 	ctx := context.Background()
@@ -1751,7 +1750,6 @@ func TestRequestIDHeader_Commit_ContextDeadlineExceeded(t *testing.T) {
 }
 
 func TestRequestIDHeader_VerifyChannelNumber(t *testing.T) {
-	skipDirectPathTest(t)
 	t.Parallel()
 
 	ctx := context.Background()

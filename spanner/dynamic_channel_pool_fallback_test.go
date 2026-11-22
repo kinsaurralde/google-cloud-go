@@ -95,7 +95,7 @@ func TestDCPDirectPathFallbackDefaults(t *testing.T) {
 		fallback string
 		want     bool
 	}{
-		{name: "fallback is off by default", fallback: "", want: false},
+		{name: "fallback is on by default", fallback: "", want: true},
 		{name: "fallback enabled by environment", fallback: "true", want: true},
 		{name: "fallback disabled by environment", fallback: "false", want: false},
 	}
